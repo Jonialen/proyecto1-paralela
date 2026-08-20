@@ -189,12 +189,20 @@ static int clip_near_plane(const ClipVertex *in, int in_count, ClipVertex *out)
     return out_count;
 }
 
-static ScreenVertex to_screen(ClipVertex c, int fb_width, int fb_height)
+Viewport viewport_full(const Framebuffer *fb)
+{
+    Viewport view = { 0, 0, fb->fb_width, fb->fb_height };
+    return view;
+}
+
+/* NDC maps into the VIEWPORT rectangle, not the whole framebuffer. This one
+ * line is what turns the renderer from single-view into split-screen. */
+static ScreenVertex to_screen(ClipVertex c, const Viewport *view)
 {
     ScreenVertex s;
     float inv_w = 1.0f / c.clip.w;
-    s.x = (c.clip.x * inv_w * 0.5f + 0.5f) * (float)fb_width;
-    s.y = (0.5f - c.clip.y * inv_w * 0.5f) * (float)fb_height;
+    s.x = (float)view->x + (c.clip.x * inv_w * 0.5f + 0.5f) * (float)view->width;
+    s.y = (float)view->y + (0.5f - c.clip.y * inv_w * 0.5f) * (float)view->height;
     s.z = c.clip.z * inv_w;
     s.inv_w = inv_w;
     s.u_w = c.u * inv_w;
@@ -213,7 +221,7 @@ static int imin(int a, int b) { return a < b ? a : b; }
 /* Culls, bounds and appends one triangle. Returns 1 if it was kept. */
 static int emit_triangle(TriangleBuffer *out, const Texture *tex, float light,
                          ScreenVertex a, ScreenVertex b, ScreenVertex c,
-                         int fb_width, int fb_height)
+                         const Viewport *view)
 {
     /* Screen space has y pointing down, so a front-facing (CCW in 3D) triangle
      * yields a negative signed area. Anything else is a backface: cull it. */
@@ -226,12 +234,14 @@ static int emit_triangle(TriangleBuffer *out, const Texture *tex, float light,
     tri.v[2] = c;
     tri.tex = tex;
     tri.light = light;
-    tri.min_x = imax(0, (int)floorf(fminf(fminf(a.x, b.x), c.x)));
-    tri.max_x = imin(fb_width - 1, (int)ceilf(fmaxf(fmaxf(a.x, b.x), c.x)));
-    tri.min_y = imax(0, (int)floorf(fminf(fminf(a.y, b.y), c.y)));
-    tri.max_y = imin(fb_height - 1, (int)ceilf(fmaxf(fmaxf(a.y, b.y), c.y)));
+    /* Clamped to the viewport, so geometry from one camera can never bleed into
+     * a neighbouring split-screen pane. */
+    tri.min_x = imax(view->x, (int)floorf(fminf(fminf(a.x, b.x), c.x)));
+    tri.max_x = imin(view->x + view->width - 1, (int)ceilf(fmaxf(fmaxf(a.x, b.x), c.x)));
+    tri.min_y = imax(view->y, (int)floorf(fminf(fminf(a.y, b.y), c.y)));
+    tri.max_y = imin(view->y + view->height - 1, (int)ceilf(fmaxf(fmaxf(a.y, b.y), c.y)));
 
-    /* Fully off-screen: drop it before it ever reaches the raster stage. */
+    /* Fully outside the viewport: drop it before it ever reaches the raster. */
     if (tri.min_x > tri.max_x || tri.min_y > tri.max_y)
         return 0;
 
@@ -239,7 +249,7 @@ static int emit_triangle(TriangleBuffer *out, const Texture *tex, float light,
 }
 
 size_t cube_emit(TriangleBuffer *out, const Block *block, Mat4 model, Mat4 vp,
-                 Vec3 light_dir, unsigned face_mask, int fb_width, int fb_height)
+                 Vec3 light_dir, unsigned face_mask, const Viewport *view)
 {
     if (!block || (face_mask & FACE_ALL) == 0)
         return 0;
@@ -278,12 +288,11 @@ size_t cube_emit(TriangleBuffer *out, const Block *block, Mat4 model, Mat4 vp,
 
         ScreenVertex sv[8];
         for (int i = 0; i < count; i++)
-            sv[i] = to_screen(poly[i], fb_width, fb_height);
+            sv[i] = to_screen(poly[i], view);
 
         for (int i = 1; i + 1 < count; i++)
             emitted += (size_t)emit_triangle(out, tex, light_term,
-                                             sv[0], sv[i], sv[i + 1],
-                                             fb_width, fb_height);
+                                             sv[0], sv[i], sv[i + 1], view);
     }
 
     return emitted;

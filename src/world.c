@@ -66,7 +66,7 @@ unsigned chunk_face_mask(const Chunk *chunk, int x, int y, int z)
  * faces of geometry. */
 static size_t emit_block(TriangleBuffer *out, uint8_t id, unsigned mask,
                          Vec3 origin, int x, int y, int z,
-                         Mat4 vp, Vec3 light_dir, int fb_width, int fb_height)
+                         Mat4 vp, Vec3 light_dir, const Viewport *view)
 {
     const Block *block = block_from_id(id);
     if (!block)
@@ -77,11 +77,11 @@ static size_t emit_block(TriangleBuffer *out, uint8_t id, unsigned mask,
     Mat4 model = mat4_translate(origin.x + (float)x + 0.5f,
                                 origin.y + (float)y + 0.5f,
                                 origin.z + (float)z + 0.5f);
-    return cube_emit(out, block, model, vp, light_dir, mask, fb_width, fb_height);
+    return cube_emit(out, block, model, vp, light_dir, mask, view);
 }
 
 size_t chunk_emit(TriangleBuffer *out, const Chunk *chunk, Vec3 origin,
-                  Mat4 vp, Vec3 light_dir, int fb_width, int fb_height)
+                  Mat4 vp, Vec3 light_dir, const Viewport *view)
 {
     size_t emitted = 0;
 
@@ -97,7 +97,7 @@ size_t chunk_emit(TriangleBuffer *out, const Chunk *chunk, Vec3 origin,
                     continue; /* fully buried, nothing to draw */
 
                 emitted += emit_block(out, id, mask, origin, x, y, z,
-                                      vp, light_dir, fb_width, fb_height);
+                                      vp, light_dir, view);
             }
         }
     }
@@ -279,7 +279,7 @@ static unsigned world_face_mask(const World *world, int x, int y, int z)
 }
 
 size_t world_emit(TriangleBuffer *out, const World *world, Mat4 vp,
-                  Vec3 light_dir, int fb_width, int fb_height)
+                  Vec3 light_dir, const Viewport *view)
 {
     size_t emitted = 0;
     int span_x = world->size * CHUNK_SIZE_X;
@@ -297,7 +297,7 @@ size_t world_emit(TriangleBuffer *out, const World *world, Mat4 vp,
                     continue;
 
                 emitted += emit_block(out, id, mask, world->origin, x, y, z,
-                                      vp, light_dir, fb_width, fb_height);
+                                      vp, light_dir, view);
             }
         }
     }

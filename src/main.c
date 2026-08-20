@@ -5,12 +5,17 @@
 #include <math.h>
 #include <time.h>
 
+#include "camera.h"
 #include "math3d.h"
+#include "overlay.h"
 #include "render.h"
 #include "texture.h"
 #include "world.h"
 
 #define PI 3.14159265358979323846f
+#define MAX_PLAYERS 16
+#define MAX_CHUNKS 64
+#define BENCH_DT (1.0f / 60.0f) /* fixed step: benchmarks must be reproducible */
 
 enum { SCENE_BLOCK, SCENE_CHUNK };
 
@@ -18,20 +23,40 @@ typedef struct {
     int width;
     int height;
     int ssaa;
-    int block;
-    int scene;
+    int players;
     int chunks;
     unsigned seed;
-    int bench_frames;      /* > 0 runs headless and prints timings */
-    const char *dump_path; /* non-NULL renders a single frame to a PPM file */
+    int block;
+    int scene;
+    int bench_frames;
+    const char *dump_path;
 } Options;
 
-/* Everything the geometry stage needs, kept in one place so the interactive,
- * benchmark and dump paths all build their frames the exact same way. */
+/* One camera rendering into one viewport, with its own triangle list.
+ *
+ * This is the unit of parallel work. Two views share nothing: disjoint
+ * framebuffer rectangles, private triangle buffers, read-only access to the
+ * world. Parallelizing the renderer means running the loop over ViewTasks
+ * concurrently -- no locks, no atomics, no reduction.
+ *
+ * `world` is a pointer rather than a shared global on purpose: today every view
+ * points at the same world, but pointing them at different worlds is all that
+ * separates split-screen from independent sub-worlds. */
+typedef struct {
+    Camera camera;
+    const World *world;
+    Viewport viewport;
+    TriangleBuffer triangles;
+    size_t triangle_count;
+} ViewTask;
+
 typedef struct {
     int scene;
     int block_index;
-    World world;
+    World *worlds;
+    int world_count;
+    ViewTask *views;
+    int view_count;
     Vec3 light;
 } Scene;
 
@@ -42,174 +67,307 @@ static double now_seconds(void)
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
-static int scene_init(Scene *scene, int scene_kind, int block_index,
-                      int chunks, unsigned seed)
-{
-    scene->scene = scene_kind;
-    scene->block_index = block_index;
-    scene->light = vec3_normalize(vec3_make(0.45f, 0.8f, 0.6f));
+/* -------------------------------------------------------- viewport layout */
 
-    TerrainParams params = terrain_default(seed);
-    if (!world_init(&scene->world, chunks, &params)) {
-        fprintf(stderr, "Out of memory allocating the world\n");
-        return 0;
+/* Tiles `count` viewports over the framebuffer in the squarest grid that fits.
+ * Trailing rows absorb the remainder so no pixel column is left unpainted. */
+static void layout_viewports(ViewTask *views, int count, int fb_width, int fb_height)
+{
+    int cols = (int)ceil(sqrt((double)count));
+    if (cols < 1) cols = 1;
+    int rows = (count + cols - 1) / cols;
+
+    for (int i = 0; i < count; i++) {
+        int col = i % cols;
+        int row = i / cols;
+        int x0 = fb_width * col / cols;
+        int x1 = fb_width * (col + 1) / cols;
+        int y0 = fb_height * row / rows;
+        int y1 = fb_height * (row + 1) / rows;
+
+        views[i].viewport.x = x0;
+        views[i].viewport.y = y0;
+        views[i].viewport.width = x1 - x0;
+        views[i].viewport.height = y1 - y0;
     }
-    world_generate(&scene->world);
-    return 1;
 }
+
+/* ------------------------------------------------------------------ scene */
 
 static void scene_free(Scene *scene)
 {
-    world_free(&scene->world);
+    if (scene->views) {
+        for (int i = 0; i < scene->view_count; i++)
+            tribuf_free(&scene->views[i].triangles);
+        free(scene->views);
+        scene->views = NULL;
+    }
+    if (scene->worlds) {
+        for (int i = 0; i < scene->world_count; i++)
+            world_free(&scene->worlds[i]);
+        free(scene->worlds);
+        scene->worlds = NULL;
+    }
+    scene->view_count = 0;
+    scene->world_count = 0;
 }
 
-/* Reseeds and regenerates in place, keeping the same allocation. */
-static void scene_reseed(Scene *scene, unsigned seed)
+static int scene_init(Scene *scene, const Options *opt)
 {
-    scene->world.params.seed = seed;
-    world_generate(&scene->world);
+    memset(scene, 0, sizeof(*scene));
+    scene->scene = opt->scene;
+    scene->block_index = opt->block;
+    scene->light = vec3_normalize(vec3_make(0.45f, 0.8f, 0.6f));
+
+    /* One world today. Raising world_count and handing each view a different
+     * entry is the whole change needed for independent sub-worlds. */
+    scene->world_count = 1;
+    scene->worlds = calloc((size_t)scene->world_count, sizeof(World));
+    scene->views = calloc((size_t)opt->players, sizeof(ViewTask));
+    if (!scene->worlds || !scene->views) {
+        fprintf(stderr, "Error: out of memory allocating the scene\n");
+        scene_free(scene);
+        return 0;
+    }
+
+    TerrainParams params = terrain_default(opt->seed);
+    if (!world_init(&scene->worlds[0], opt->chunks, &params)) {
+        fprintf(stderr, "Error: out of memory allocating a world of %dx%d chunks\n",
+                opt->chunks, opt->chunks);
+        scene_free(scene);
+        return 0;
+    }
+    world_generate(&scene->worlds[0]);
+
+    float extent = (float)(opt->chunks * CHUNK_SIZE_X);
+    /* Highest ground the generator can reach, in world units: the explorers
+     * must fly above the peaks, not above the average. */
+    float peak = scene->worlds[0].origin.y + params.base_height + params.amplitude;
+
+    scene->view_count = opt->players;
+    for (int i = 0; i < scene->view_count; i++) {
+        scene->views[i].camera = camera_make(i, scene->view_count, extent, peak);
+        scene->views[i].world = &scene->worlds[0];
+        tribuf_init(&scene->views[i].triangles);
+    }
+    return 1;
 }
 
-/* Width of the scene in world units. Every camera limit is derived from it, so
- * nothing artificially caps how much world you can load and look at. */
-static float scene_extent(const Scene *scene)
+/* --------------------------------------------------------------- rendering */
+
+/* Renders one view. Everything it touches is private to that view or read-only,
+ * which is what makes the loop over views safe to run in parallel. */
+static void render_view(Framebuffer *fb, ViewTask *view, const Scene *scene, float t)
 {
-    if (scene->scene != SCENE_CHUNK)
-        return 1.0f;
-    return (float)(scene->world.size * CHUNK_SIZE_X);
+    Mat4 vp = camera_view_proj(&view->camera, t, viewport_aspect(&view->viewport));
+
+    tribuf_clear(&view->triangles);
+    if (scene->scene == SCENE_CHUNK) {
+        view->triangle_count = world_emit(&view->triangles, view->world, vp,
+                                          scene->light, &view->viewport);
+    } else {
+        view->triangle_count = cube_emit(&view->triangles, block_get(scene->block_index),
+                                         mat4_identity(), vp, scene->light,
+                                         FACE_ALL, &view->viewport);
+    }
+    raster_flush(fb, &view->triangles);
 }
 
-static float scene_default_distance(const Scene *scene)
+static size_t render_frame(Framebuffer *fb, Scene *scene, float t)
 {
-    return 1.9f * scene_extent(scene);
+    framebuffer_clear(fb, 0x0E1622);
+
+    /* >>> The parallel decomposition lives here: this loop over independent
+     * views is the one that becomes an OpenMP parallel for. <<< */
+    for (int i = 0; i < scene->view_count; i++)
+        render_view(fb, &scene->views[i], scene, t);
+
+    size_t total = 0;
+    for (int i = 0; i < scene->view_count; i++)
+        total += scene->views[i].triangle_count;
+    return total;
 }
 
-static float scene_max_distance(const Scene *scene)
+/* Thin separators so the split-screen panes read as separate windows. */
+static void draw_viewport_borders(Framebuffer *fb, const Scene *scene)
 {
-    return 8.0f * scene_extent(scene);
+    if (scene->view_count < 2)
+        return;
+
+    const uint32_t border = 0x2C3A4E;
+    for (int i = 0; i < scene->view_count; i++) {
+        const Viewport *v = &scene->views[i].viewport;
+        for (int x = v->x; x < v->x + v->width; x++) {
+            fb->color[(size_t)v->y * fb->fb_width + (size_t)x] = border;
+            fb->color[(size_t)(v->y + v->height - 1) * fb->fb_width + (size_t)x] = border;
+        }
+        for (int y = v->y; y < v->y + v->height; y++) {
+            fb->color[(size_t)y * fb->fb_width + (size_t)v->x] = border;
+            fb->color[(size_t)y * fb->fb_width + (size_t)(v->x + v->width - 1)] = border;
+        }
+    }
 }
 
-/* The far plane has to reach past the furthest corner of the world, otherwise
- * distant geometry lands beyond NDC z = 1, fails the depth test and silently
- * disappears -- which looks exactly like a render limit. */
-static float scene_far_plane(const Scene *scene, float distance)
+/* --------------------------------------------------------------------- HUD */
+
+#define HUD_SCALE 2
+#define HUD_MARGIN 8
+#define HUD_MIN_FPS 30.0
+
+/* Draws the on-screen readout. The FPS number turns red below 30 because that
+ * is the floor the project has to hold, so a failing frame rate is visible at a
+ * glance instead of having to be read off a number. */
+static void draw_hud(uint32_t *pixels, int width, int height, const Scene *scene,
+                     double fps, size_t triangles, int ssaa)
 {
-    return distance + 2.0f * scene_extent(scene) + 10.0f;
+    char line[128];
+    int line_h = OVERLAY_GLYPH_H * HUD_SCALE;
+
+    snprintf(line, sizeof(line), "FPS %.1f", fps);
+    int fps_w = overlay_text_width(line, HUD_SCALE);
+
+    char info[128];
+    snprintf(info, sizeof(info), "VIEWS %d  TRIS %zu  SSAA %d  SEQUENTIAL",
+             scene->view_count, triangles, ssaa);
+    int info_w = overlay_text_width(info, HUD_SCALE);
+
+    int panel_w = (fps_w > info_w ? fps_w : info_w) + 2 * HUD_MARGIN;
+    int panel_h = 2 * line_h + 3 * HUD_MARGIN / 2;
+    overlay_panel(pixels, width, height, 0, 0, panel_w, panel_h, 0x000000, 150);
+
+    uint32_t fps_color = (fps < HUD_MIN_FPS) ? 0xFF5C5C : 0x7CFF9A;
+    overlay_text(pixels, width, height, HUD_MARGIN, HUD_MARGIN / 2,
+                 HUD_SCALE, fps_color, line);
+    overlay_text(pixels, width, height, HUD_MARGIN, HUD_MARGIN / 2 + line_h + 2,
+                 HUD_SCALE, 0xD8E4F0, info);
+
+    if (scene->view_count < 2)
+        return;
+
+    /* Per-view label. Viewports live in supersampled coordinates, so they are
+     * divided down to the resolved image the HUD is drawn on. */
+    for (int i = 0; i < scene->view_count; i++) {
+        const Viewport *v = &scene->views[i].viewport;
+        int vx = v->x / ssaa;
+        int vy = v->y / ssaa;
+
+        snprintf(line, sizeof(line), "P%d  %zu TRIS", i, scene->views[i].triangle_count);
+        int w = overlay_text_width(line, 1);
+        int x = vx + 6;
+        int y = vy + v->height / ssaa - OVERLAY_GLYPH_H - 6;
+
+        overlay_panel(pixels, width, height, x - 3, y - 3,
+                      w + 6, OVERLAY_GLYPH_H + 6, 0x000000, 130);
+        overlay_text(pixels, width, height, x, y, 1, 0xC9D8E8, line);
+    }
 }
 
-/* Orbit camera: the eye sits on a sphere around the origin, so both scenes use
- * the same controls and the light stays fixed in world space. */
-static Mat4 build_view_proj(float yaw, float pitch, float distance, float aspect,
-                            float far_plane)
-{
-    Vec3 eye = vec3_make(distance * cosf(pitch) * sinf(yaw),
-                         distance * sinf(pitch),
-                         distance * cosf(pitch) * cosf(yaw));
-    Mat4 view = mat4_look_at(eye, vec3_make(0.0f, 0.0f, 0.0f),
-                             vec3_make(0.0f, 1.0f, 0.0f));
-    Mat4 proj = mat4_perspective(50.0f * PI / 180.0f, aspect, 0.1f, far_plane);
-    return mat4_mul(proj, view);
-}
-
-/* Geometry stage. Both scenes funnel through cube_emit(): the single block
- * passes an identity model and FACE_ALL, the chunk lets chunk_emit() derive one
- * model matrix and one face mask per voxel. */
-static size_t scene_emit(TriangleBuffer *tris, const Scene *scene, Mat4 vp,
-                         int fb_width, int fb_height)
-{
-    tribuf_clear(tris);
-
-    if (scene->scene == SCENE_CHUNK)
-        return world_emit(tris, &scene->world, vp, scene->light,
-                          fb_width, fb_height);
-
-    return cube_emit(tris, block_get(scene->block_index), mat4_identity(), vp,
-                     scene->light, FACE_ALL, fb_width, fb_height);
-}
-
-static size_t render_frame(Framebuffer *fb, TriangleBuffer *tris, const Scene *scene,
-                           float yaw, float pitch, float distance)
-{
-    float aspect = (float)fb->width / (float)fb->height;
-    Mat4 vp = build_view_proj(yaw, pitch, distance, aspect,
-                              scene_far_plane(scene, distance));
-
-    size_t count = scene_emit(tris, scene, vp, fb->fb_width, fb->fb_height);
-    framebuffer_clear(fb, 0x101820);
-    raster_flush(fb, tris);
-    return count;
-}
+/* ------------------------------------------------------------------- CLI */
 
 static void print_usage(const char *prog)
 {
     printf("Usage: %s [options]\n", prog);
-    printf("  --width N       window width  (default 900)\n");
-    printf("  --height N      window height (default 700)\n");
-    printf("  --ssaa N        supersampling factor, 1-8 (default 1)\n");
-    printf("  --block N       initial block index, 0-%d (default 0)\n", block_count() - 1);
-    printf("  --scene NAME    'block' or 'chunk' (default block)\n");
-    printf("  --chunks N      world size in chunks per side, 1-64 (default 1)\n");
-    printf("  --seed N        terrain seed (default 1337)\n");
-    printf("  --bench N       render N frames headless and report timings\n");
-    printf("  --dump PATH     render one frame headless into a binary PPM file\n");
-    printf("  --help          show this message\n");
+    printf("  -n, --players N   explorers rendered in split-screen, 1-%d (default 1)\n", MAX_PLAYERS);
+    printf("      --chunks N    world size in chunks per side, 1-%d (default 4)\n", MAX_CHUNKS);
+    printf("      --seed N      terrain seed (default 1337)\n");
+    printf("      --width N     window width  (default 960, minimum 640)\n");
+    printf("      --height N    window height (default 720, minimum 480)\n");
+    printf("      --ssaa N      supersampling factor, 1-8 (default 1)\n");
+    printf("      --scene NAME  'chunk' or 'block' (default chunk)\n");
+    printf("      --block N     block index for the block scene, 0-%d\n", block_count() - 1);
+    printf("      --bench N     render N frames headless and report timings\n");
+    printf("      --dump PATH   render one frame headless into a binary PPM file\n");
+    printf("      --help        show this message\n");
 }
 
+/* Parses one integer argument with range checking. Returns 0 and complains on
+ * anything that is not a well-formed number inside [low, high]. */
+static int parse_int(const char *text, const char *flag, long low, long high, long *out)
+{
+    char *end = NULL;
+    long value = strtol(text, &end, 10);
+    if (end == text || *end != '\0') {
+        fprintf(stderr, "Error: %s expects an integer, got '%s'\n", flag, text);
+        return 0;
+    }
+    if (value < low || value > high) {
+        fprintf(stderr, "Error: %s must be between %ld and %ld, got %ld\n", flag, low, high, value);
+        return 0;
+    }
+    *out = value;
+    return 1;
+}
+
+/* Returns 1 to run, 0 to exit cleanly (--help), -1 on a bad argument. */
 static int parse_options(int argc, char **argv, Options *opt)
 {
     for (int i = 1; i < argc; i++) {
+        const char *flag = argv[i];
         int has_value = (i + 1 < argc);
-        if (!strcmp(argv[i], "--help")) {
+        long value = 0;
+
+        if (!strcmp(flag, "--help") || !strcmp(flag, "-h")) {
             print_usage(argv[0]);
             return 0;
-        } else if (!strcmp(argv[i], "--width") && has_value) {
-            opt->width = atoi(argv[++i]);
-        } else if (!strcmp(argv[i], "--height") && has_value) {
-            opt->height = atoi(argv[++i]);
-        } else if (!strcmp(argv[i], "--ssaa") && has_value) {
-            opt->ssaa = atoi(argv[++i]);
-        } else if (!strcmp(argv[i], "--block") && has_value) {
-            opt->block = atoi(argv[++i]);
-        } else if (!strcmp(argv[i], "--scene") && has_value) {
+        }
+
+        if (!has_value) {
+            fprintf(stderr, "Error: %s requires a value\n", flag);
+            return -1;
+        }
+
+        if (!strcmp(flag, "--players") || !strcmp(flag, "-n")) {
+            if (!parse_int(argv[++i], flag, 1, MAX_PLAYERS, &value)) return -1;
+            opt->players = (int)value;
+        } else if (!strcmp(flag, "--chunks")) {
+            if (!parse_int(argv[++i], flag, 1, MAX_CHUNKS, &value)) return -1;
+            opt->chunks = (int)value;
+        } else if (!strcmp(flag, "--seed")) {
+            if (!parse_int(argv[++i], flag, 0, 2147483647L, &value)) return -1;
+            opt->seed = (unsigned)value;
+        } else if (!strcmp(flag, "--width")) {
+            if (!parse_int(argv[++i], flag, 640, 7680, &value)) return -1;
+            opt->width = (int)value;
+        } else if (!strcmp(flag, "--height")) {
+            if (!parse_int(argv[++i], flag, 480, 4320, &value)) return -1;
+            opt->height = (int)value;
+        } else if (!strcmp(flag, "--ssaa")) {
+            if (!parse_int(argv[++i], flag, 1, 8, &value)) return -1;
+            opt->ssaa = (int)value;
+        } else if (!strcmp(flag, "--block")) {
+            if (!parse_int(argv[++i], flag, 0, block_count() - 1, &value)) return -1;
+            opt->block = (int)value;
+        } else if (!strcmp(flag, "--bench")) {
+            if (!parse_int(argv[++i], flag, 1, 100000, &value)) return -1;
+            opt->bench_frames = (int)value;
+        } else if (!strcmp(flag, "--scene")) {
             const char *name = argv[++i];
             if (!strcmp(name, "chunk")) {
                 opt->scene = SCENE_CHUNK;
             } else if (!strcmp(name, "block")) {
                 opt->scene = SCENE_BLOCK;
             } else {
-                fprintf(stderr, "Unknown scene: %s (expected 'block' or 'chunk')\n", name);
-                return 0;
+                fprintf(stderr, "Error: --scene expects 'chunk' or 'block', got '%s'\n", name);
+                return -1;
             }
-        } else if (!strcmp(argv[i], "--chunks") && has_value) {
-            opt->chunks = atoi(argv[++i]);
-        } else if (!strcmp(argv[i], "--seed") && has_value) {
-            opt->seed = (unsigned)strtoul(argv[++i], NULL, 10);
-        } else if (!strcmp(argv[i], "--bench") && has_value) {
-            opt->bench_frames = atoi(argv[++i]);
-        } else if (!strcmp(argv[i], "--dump") && has_value) {
+        } else if (!strcmp(flag, "--dump")) {
             opt->dump_path = argv[++i];
         } else {
-            fprintf(stderr, "Unknown or incomplete option: %s\n", argv[i]);
+            fprintf(stderr, "Error: unknown option '%s'\n", flag);
             print_usage(argv[0]);
-            return 0;
+            return -1;
         }
     }
-
-    if (opt->width < 64) opt->width = 64;
-    if (opt->height < 64) opt->height = 64;
-    if (opt->ssaa < 1) opt->ssaa = 1;
-    if (opt->ssaa > 8) opt->ssaa = 8;
-    if (opt->chunks < 1) opt->chunks = 1;
-    if (opt->chunks > 64) opt->chunks = 64; /* 64x64 chunks is ~32 MB of voxels */
     return 1;
 }
 
-/* Binary PPM is the simplest lossless format to diff two renderers with. */
+/* --------------------------------------------------------- headless modes */
+
 static int write_ppm(const char *path, const uint32_t *pixels, int width, int height)
 {
     FILE *file = fopen(path, "wb");
     if (!file) {
-        fprintf(stderr, "Cannot open %s for writing\n", path);
+        fprintf(stderr, "Error: cannot open '%s' for writing\n", path);
         return 0;
     }
     fprintf(file, "P6\n%d %d\n255\n", width, height);
@@ -225,15 +383,12 @@ static int write_ppm(const char *path, const uint32_t *pixels, int width, int he
     return 1;
 }
 
-/* Allocates the framebuffer, the resolve buffer and the triangle list together
- * because every headless mode needs the same three. */
-static int alloc_frame_resources(const Options *opt, Framebuffer *fb,
-                                 uint32_t **resolved, TriangleBuffer *tris)
+static int alloc_frame_resources(const Options *opt, Framebuffer *fb, uint32_t **resolved)
 {
-    tribuf_init(tris);
     *resolved = malloc((size_t)opt->width * opt->height * sizeof(uint32_t));
     if (!framebuffer_init(fb, opt->width, opt->height, opt->ssaa) || !*resolved) {
-        fprintf(stderr, "Out of memory allocating buffers\n");
+        fprintf(stderr, "Error: out of memory allocating a %dx%d framebuffer at ssaa %d\n",
+                opt->width, opt->height, opt->ssaa);
         free(*resolved);
         *resolved = NULL;
         return 0;
@@ -244,142 +399,93 @@ static int alloc_frame_resources(const Options *opt, Framebuffer *fb,
 static int run_dump(const Options *opt)
 {
     Framebuffer fb;
-    TriangleBuffer tris;
     uint32_t *resolved;
-    if (!alloc_frame_resources(opt, &fb, &resolved, &tris))
-        return 1;
-
     Scene scene;
-    if (!scene_init(&scene, opt->scene, opt->block, opt->chunks, opt->seed)) {
+
+    if (!alloc_frame_resources(opt, &fb, &resolved))
+        return 1;
+    if (!scene_init(&scene, opt)) {
         free(resolved);
-        tribuf_free(&tris);
         framebuffer_free(&fb);
         return 1;
     }
+    layout_viewports(scene.views, scene.view_count, fb.fb_width, fb.fb_height);
 
-    size_t count = render_frame(&fb, &tris, &scene, 0.6f, 0.35f,
-                                scene_default_distance(&scene));
+    double t0 = now_seconds();
+    size_t count = render_frame(&fb, &scene, 4.0f);
+    double frame_seconds = now_seconds() - t0;
+    draw_viewport_borders(&fb, &scene);
     framebuffer_resolve(&fb, resolved);
+    draw_hud(resolved, opt->width, opt->height, &scene,
+             frame_seconds > 0.0 ? 1.0 / frame_seconds : 0.0, count, opt->ssaa);
 
     int ok = write_ppm(opt->dump_path, resolved, opt->width, opt->height);
     if (ok)
-        printf("Wrote %s (%dx%d, %zu triangles)\n",
-               opt->dump_path, opt->width, opt->height, count);
+        printf("Wrote %s (%dx%d, %d views, %zu triangles)\n",
+               opt->dump_path, opt->width, opt->height, scene.view_count, count);
 
-    free(resolved);
-    tribuf_free(&tris);
-    framebuffer_free(&fb);
     scene_free(&scene);
+    free(resolved);
+    framebuffer_free(&fb);
     return ok ? 0 : 1;
 }
 
 static int run_benchmark(const Options *opt)
 {
     Framebuffer fb;
-    TriangleBuffer tris;
     uint32_t *resolved;
-    if (!alloc_frame_resources(opt, &fb, &resolved, &tris))
-        return 1;
-
     Scene scene;
-    if (!scene_init(&scene, opt->scene, opt->block, opt->chunks, opt->seed)) {
+
+    if (!alloc_frame_resources(opt, &fb, &resolved))
+        return 1;
+    if (!scene_init(&scene, opt)) {
         free(resolved);
-        tribuf_free(&tris);
         framebuffer_free(&fb);
         return 1;
     }
-    float distance = scene_default_distance(&scene);
+    layout_viewports(scene.views, scene.view_count, fb.fb_width, fb.fb_height);
 
-    printf("Benchmark: %dx%d, ssaa=%d (%dx%d internal), scene=%s, frames=%d\n",
+    printf("Benchmark: %dx%d, ssaa=%d (%dx%d internal), players=%d, chunks=%d, frames=%d\n",
            opt->width, opt->height, opt->ssaa, fb.fb_width, fb.fb_height,
-           opt->scene == SCENE_CHUNK ? "chunk" : block_get(opt->block)->name,
-           opt->bench_frames);
+           opt->players, opt->chunks, opt->bench_frames);
 
-    size_t last_count = 0;
-    double geometry_time = 0.0;
-    double raster_time = 0.0;
+    size_t last_total = 0;
     double start = now_seconds();
-
-    for (int frame = 0; frame < opt->bench_frames; frame++) {
-        float yaw = (float)frame * 0.017f;
-        float pitch = 0.45f + 0.25f * sinf((float)frame * 0.011f);
-        Mat4 vp = build_view_proj(yaw, pitch, distance,
-                                  (float)opt->width / (float)opt->height,
-                                  scene_far_plane(&scene, distance));
-
-        /* Timed separately: the two stages parallelize in completely different
-         * ways, so the split tells you which one is worth attacking first. */
-        double t0 = now_seconds();
-        last_count = scene_emit(&tris, &scene, vp, fb.fb_width, fb.fb_height);
-        double t1 = now_seconds();
-
-        framebuffer_clear(&fb, 0x101820);
-        raster_flush(&fb, &tris);
-        framebuffer_resolve(&fb, resolved);
-        double t2 = now_seconds();
-
-        geometry_time += t1 - t0;
-        raster_time += t2 - t1;
-    }
+    for (int frame = 0; frame < opt->bench_frames; frame++)
+        last_total = render_frame(&fb, &scene, (float)frame * BENCH_DT);
     double elapsed = now_seconds() - start;
 
     double per_frame_ms = elapsed * 1000.0 / opt->bench_frames;
-    double mpix = (double)fb.fb_width * fb.fb_height * opt->bench_frames / 1e6;
-    if (opt->scene == SCENE_CHUNK) {
-        size_t solid = world_solid_blocks(&scene.world);
-        printf("Solid blocks: %zu | faces without culling: %zu\n", solid, solid * 6);
-    }
-    printf("Triangles:  %zu (last frame)\n", last_count);
+    printf("Triangles:  %zu (last frame, all views)\n", last_total);
+    for (int i = 0; i < scene.view_count; i++)
+        printf("  view %d: %zu triangles\n", i, scene.views[i].triangle_count);
     printf("Total:      %.4f s\n", elapsed);
     printf("Per frame:  %.4f ms  (%.2f FPS)\n", per_frame_ms, 1000.0 / per_frame_ms);
-    printf("  geometry: %.4f ms  (%.1f%%)\n",
-           geometry_time * 1000.0 / opt->bench_frames, 100.0 * geometry_time / elapsed);
-    printf("  raster:   %.4f ms  (%.1f%%)\n",
-           raster_time * 1000.0 / opt->bench_frames, 100.0 * raster_time / elapsed);
-    printf("Throughput: %.2f Mpixel/s (internal resolution)\n", mpix / elapsed);
 
-    free(resolved);
-    tribuf_free(&tris);
-    framebuffer_free(&fb);
     scene_free(&scene);
+    free(resolved);
+    framebuffer_free(&fb);
     return 0;
 }
 
-static void update_title(SDL_Window *window, const Scene *scene, int ssaa,
-                         size_t triangles, double fps)
-{
-    char title[224];
-    snprintf(title, sizeof(title),
-             "Voxel (sequential) | %s | %zu tris | ssaa x%d | %.1f FPS",
-             scene->scene == SCENE_CHUNK ? "Chunk" : block_get(scene->block_index)->name,
-             triangles, ssaa, fps);
-    SDL_SetWindowTitle(window, title);
-}
+/* ----------------------------------------------------------- interactive */
 
 static int run_interactive(const Options *opt)
 {
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
-        fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
+        fprintf(stderr, "Error: SDL_Init failed: %s\n", SDL_GetError());
         return 1;
     }
 
-    SDL_Window *window = SDL_CreateWindow("Voxel (sequential)",
+    SDL_Window *window = SDL_CreateWindow("Voxel Screensaver (sequential)",
                                           SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                           opt->width, opt->height, 0);
     SDL_Renderer *renderer = window ? SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED) : NULL;
     SDL_Texture *screen = renderer ? SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGB888,
                                                        SDL_TEXTUREACCESS_STREAMING,
                                                        opt->width, opt->height) : NULL;
-    Framebuffer fb;
-    TriangleBuffer tris;
-    uint32_t *resolved = NULL;
-
-    if (!window || !renderer || !screen || !alloc_frame_resources(opt, &fb, &resolved, &tris)) {
-        if (window && renderer && screen)
-            fprintf(stderr, "Out of memory allocating buffers\n");
-        else
-            fprintf(stderr, "SDL setup failed: %s\n", SDL_GetError());
-        free(resolved);
+    if (!window || !renderer || !screen) {
+        fprintf(stderr, "Error: SDL setup failed: %s\n", SDL_GetError());
         if (screen) SDL_DestroyTexture(screen);
         if (renderer) SDL_DestroyRenderer(renderer);
         if (window) SDL_DestroyWindow(window);
@@ -387,10 +493,11 @@ static int run_interactive(const Options *opt)
         return 1;
     }
 
+    Framebuffer fb;
+    uint32_t *resolved;
     Scene scene;
-    if (!scene_init(&scene, opt->scene, opt->block, opt->chunks, opt->seed)) {
+    if (!alloc_frame_resources(opt, &fb, &resolved) || !scene_init(&scene, opt)) {
         free(resolved);
-        tribuf_free(&tris);
         framebuffer_free(&fb);
         SDL_DestroyTexture(screen);
         SDL_DestroyRenderer(renderer);
@@ -398,96 +505,41 @@ static int run_interactive(const Options *opt)
         SDL_Quit();
         return 1;
     }
+    layout_viewports(scene.views, scene.view_count, fb.fb_width, fb.fb_height);
 
-    unsigned seed = opt->seed;
-    int ssaa = opt->ssaa;
-    float yaw = 0.6f, pitch = 0.35f;
-    float distance = scene_default_distance(&scene);
-    int auto_rotate = 1;
-    int dragging = 0;
-    size_t triangles = 0;
-
-    double last_time = now_seconds();
+    double start_time = now_seconds();
+    double last_time = start_time;
     double title_timer = 0.0;
     int frames_since_title = 0;
+    size_t triangles = 0;
+    double fps = 0.0;
     int running = 1;
 
     while (running) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
-            if (event.type == SDL_QUIT) {
+            if (event.type == SDL_QUIT)
                 running = 0;
-            } else if (event.type == SDL_KEYDOWN) {
-                SDL_Keycode key = event.key.keysym.sym;
-                if (key == SDLK_ESCAPE || key == SDLK_q) {
-                    running = 0;
-                } else if (key == SDLK_TAB) {
-                    scene.scene = (scene.scene == SCENE_CHUNK) ? SCENE_BLOCK : SCENE_CHUNK;
-                    distance = scene_default_distance(&scene);
-                } else if (key == SDLK_n) {
-                    scene_reseed(&scene, ++seed);
-                    scene.scene = SCENE_CHUNK;
-                    distance = scene_default_distance(&scene);
-                } else if (key >= SDLK_1 && key <= SDLK_9) {
-                    int wanted = key - SDLK_1;
-                    if (wanted < block_count()) {
-                        scene.block_index = wanted;
-                        scene.scene = SCENE_BLOCK;
-                    }
-                } else if (key == SDLK_RIGHTBRACKET) {
-                    scene.block_index = (scene.block_index + 1) % block_count();
-                } else if (key == SDLK_LEFTBRACKET) {
-                    scene.block_index = (scene.block_index + block_count() - 1) % block_count();
-                } else if (key == SDLK_SPACE) {
-                    auto_rotate = !auto_rotate;
-                } else if (key == SDLK_r) {
-                    yaw = 0.6f; pitch = 0.35f;
-                    distance = scene_default_distance(&scene);
-                } else if (key == SDLK_PLUS || key == SDLK_EQUALS || key == SDLK_MINUS) {
-                    int wanted = ssaa + (key == SDLK_MINUS ? -1 : 1);
-                    if (wanted >= 1 && wanted <= 8) {
-                        Framebuffer next;
-                        if (framebuffer_init(&next, opt->width, opt->height, wanted)) {
-                            framebuffer_free(&fb);
-                            fb = next;
-                            ssaa = wanted;
-                        }
-                    }
-                }
-            } else if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
-                dragging = 1;
-            } else if (event.type == SDL_MOUSEBUTTONUP && event.button.button == SDL_BUTTON_LEFT) {
-                dragging = 0;
-            } else if (event.type == SDL_MOUSEMOTION && dragging) {
-                yaw -= event.motion.xrel * 0.01f;
-                pitch += event.motion.yrel * 0.01f;
-                auto_rotate = 0;
-            } else if (event.type == SDL_MOUSEWHEEL) {
-                distance -= event.wheel.y * (distance * 0.08f);
-            }
+            else if (event.type == SDL_KEYDOWN &&
+                     (event.key.keysym.sym == SDLK_ESCAPE || event.key.keysym.sym == SDLK_q))
+                running = 0;
         }
 
         double current = now_seconds();
-        float dt = (float)(current - last_time);
+        double dt = current - last_time;
         last_time = current;
 
-        const Uint8 *keys = SDL_GetKeyboardState(NULL);
-        if (keys[SDL_SCANCODE_LEFT])  { yaw -= 1.5f * dt; auto_rotate = 0; }
-        if (keys[SDL_SCANCODE_RIGHT]) { yaw += 1.5f * dt; auto_rotate = 0; }
-        if (keys[SDL_SCANCODE_UP])    { pitch += 1.5f * dt; auto_rotate = 0; }
-        if (keys[SDL_SCANCODE_DOWN])  { pitch -= 1.5f * dt; auto_rotate = 0; }
-        if (keys[SDL_SCANCODE_W]) distance -= distance * 1.5f * dt;
-        if (keys[SDL_SCANCODE_S]) distance += distance * 1.5f * dt;
-        if (auto_rotate) yaw += 0.6f * dt;
+        /* Exponential moving average: a raw per-frame reciprocal jitters too
+         * much to read, but a long window hides real stalls. */
+        if (dt > 0.0) {
+            double instant = 1.0 / dt;
+            fps = (fps <= 0.0) ? instant : fps * 0.9 + instant * 0.1;
+        }
 
-        if (pitch > 1.4f) pitch = 1.4f;
-        if (pitch < -1.4f) pitch = -1.4f;
-        float max_distance = scene_max_distance(&scene);
-        if (distance < 1.2f) distance = 1.2f;
-        if (distance > max_distance) distance = max_distance;
-
-        triangles = render_frame(&fb, &tris, &scene, yaw, pitch, distance);
+        triangles = render_frame(&fb, &scene, (float)(current - start_time));
+        draw_viewport_borders(&fb, &scene);
         framebuffer_resolve(&fb, resolved);
+        draw_hud(resolved, opt->width, opt->height, &scene, fps, triangles, opt->ssaa);
 
         SDL_UpdateTexture(screen, NULL, resolved, opt->width * (int)sizeof(uint32_t));
         SDL_RenderClear(renderer);
@@ -497,16 +549,19 @@ static int run_interactive(const Options *opt)
         frames_since_title++;
         title_timer += dt;
         if (title_timer >= 0.4) {
-            update_title(window, &scene, ssaa, triangles, frames_since_title / title_timer);
+            char title[224];
+            snprintf(title, sizeof(title),
+                     "Voxel Screensaver (sequential) | %d views | %zu tris | %.1f FPS",
+                     scene.view_count, triangles, frames_since_title / title_timer);
+            SDL_SetWindowTitle(window, title);
             title_timer = 0.0;
             frames_since_title = 0;
         }
     }
 
-    free(resolved);
-    tribuf_free(&tris);
-    framebuffer_free(&fb);
     scene_free(&scene);
+    free(resolved);
+    framebuffer_free(&fb);
     SDL_DestroyTexture(screen);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
@@ -516,19 +571,17 @@ static int run_interactive(const Options *opt)
 
 int main(int argc, char **argv)
 {
-    Options opt = { 900, 700, 1, 0, SCENE_BLOCK, 1, 1337u, 0, NULL };
+    Options opt = { 960, 720, 1, 1, 4, 1337u, 0, SCENE_CHUNK, 0, NULL };
 
     textures_init();
-    if (!parse_options(argc, argv, &opt))
-        return 0;
+
+    int status = parse_options(argc, argv, &opt);
+    if (status == 0) return 0;
+    if (status < 0) return 1;
 
     if (opt.dump_path)
         return run_dump(&opt);
-
     if (opt.bench_frames > 0)
         return run_benchmark(&opt);
-
-    printf("Controls: drag/arrows orbit | W,S or wheel zoom | TAB block <-> chunk\n");
-    printf("          1-9 pick block | [ ] cycle | +/- supersampling | N new seed | SPACE spin | R reset | ESC quit\n");
     return run_interactive(&opt);
 }

@@ -33,7 +33,7 @@ unsigned chunk_face_mask(const Chunk *chunk, int x, int y, int z);
  * of the chunk's (0,0,0) corner. Border faces are kept, which is correct for a
  * lone chunk; use world_emit() when neighbours exist. */
 size_t chunk_emit(TriangleBuffer *out, const Chunk *chunk, Vec3 origin,
-                  Mat4 vp, Vec3 light_dir, int fb_width, int fb_height);
+                  Mat4 vp, Vec3 light_dir, const Viewport *view);
 
 /* ------------------------------------------------------- terrain generation */
 
@@ -86,7 +86,7 @@ uint8_t world_get(const World *world, int x, int y, int z);
  * chunks are culled instead of being rasterized and then hidden by the depth
  * test. */
 size_t world_emit(TriangleBuffer *out, const World *world, Mat4 vp,
-                  Vec3 light_dir, int fb_width, int fb_height);
+                  Vec3 light_dir, const Viewport *view);
 
 /* Total solid blocks, for reporting how much the face culling actually saves. */
 size_t world_solid_blocks(const World *world);

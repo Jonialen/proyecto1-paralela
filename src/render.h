@@ -25,6 +25,22 @@ void framebuffer_clear(Framebuffer *fb, uint32_t color);
 /* Box-filters the supersampled buffer into out[width * height]. */
 void framebuffer_resolve(const Framebuffer *fb, uint32_t *out);
 
+/* --------------------------------------------------------------- viewport */
+
+/* A rectangle of the framebuffer that one camera renders into, in supersampled
+ * pixels. Split-screen is N viewports over one framebuffer; because they are
+ * disjoint, two cameras can never touch the same colour or depth slot. */
+typedef struct {
+    int x, y;
+    int width, height;
+} Viewport;
+
+Viewport viewport_full(const Framebuffer *fb);
+static inline float viewport_aspect(const Viewport *view)
+{
+    return (float)view->width / (float)view->height;
+}
+
 /* ------------------------------------------------------ geometry output */
 
 /* A vertex after projection and the perspective divide. u_w/v_w/inv_w carry the
@@ -82,7 +98,7 @@ enum {
  * `light_dir` must already be normalized. Returns the number of triangles
  * appended. */
 size_t cube_emit(TriangleBuffer *out, const Block *block, Mat4 model, Mat4 vp,
-                 Vec3 light_dir, unsigned face_mask, int fb_width, int fb_height);
+                 Vec3 light_dir, unsigned face_mask, const Viewport *view);
 
 /* ---------------------------------------------------------- raster stage */
 
