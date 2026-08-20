@@ -14,7 +14,6 @@
 
 #define PI 3.14159265358979323846f
 #define MAX_PLAYERS 16
-#define MAX_CHUNKS 64
 #define BENCH_DT (1.0f / 60.0f) /* fixed step: benchmarks must be reproducible */
 
 enum { SCENE_BLOCK, SCENE_CHUNK };
@@ -24,7 +23,9 @@ typedef struct {
     int height;
     int ssaa;
     int players;
-    int chunks;
+    float view_distance;
+    float roam;
+    long max_chunks;
     unsigned seed;
     int block;
     int scene;
@@ -131,22 +132,20 @@ static int scene_init(Scene *scene, const Options *opt)
     }
 
     TerrainParams params = terrain_default(opt->seed);
-    if (!world_init(&scene->worlds[0], opt->chunks, &params)) {
-        fprintf(stderr, "Error: out of memory allocating a world of %dx%d chunks\n",
-                opt->chunks, opt->chunks);
+    if (!world_init(&scene->worlds[0], &params, (size_t)opt->max_chunks)) {
+        fprintf(stderr, "Error: out of memory allocating the chunk map\n");
         scene_free(scene);
         return 0;
     }
-    world_generate(&scene->worlds[0]);
 
-    float extent = (float)(opt->chunks * CHUNK_SIZE_X);
-    /* Highest ground the generator can reach, in world units: the explorers
-     * must fly above the peaks, not above the average. */
-    float peak = scene->worlds[0].origin.y + params.base_height + params.amplitude;
+    /* Fly above the highest ground the generator can reach, not above the
+     * average, or the explorers clip through peaks. */
+    float flight_height = terrain_peak(&params) + 10.0f;
 
     scene->view_count = opt->players;
     for (int i = 0; i < scene->view_count; i++) {
-        scene->views[i].camera = camera_make(i, scene->view_count, extent, peak);
+        scene->views[i].camera = camera_make(i, scene->view_count, opt->roam,
+                                             opt->view_distance, flight_height);
         scene->views[i].world = &scene->worlds[0];
         tribuf_init(&scene->views[i].triangles);
     }
@@ -163,8 +162,10 @@ static void render_view(Framebuffer *fb, ViewTask *view, const Scene *scene, flo
 
     tribuf_clear(&view->triangles);
     if (scene->scene == SCENE_CHUNK) {
-        view->triangle_count = world_emit(&view->triangles, view->world, vp,
-                                          scene->light, &view->viewport);
+        Vec3 eye = camera_position(&view->camera, t);
+        view->triangle_count = world_emit_view(&view->triangles, view->world, eye,
+                                               view->camera.view_distance, vp,
+                                               scene->light, &view->viewport);
     } else {
         view->triangle_count = cube_emit(&view->triangles, block_get(scene->block_index),
                                          mat4_identity(), vp, scene->light,
@@ -175,6 +176,22 @@ static void render_view(Framebuffer *fb, ViewTask *view, const Scene *scene, flo
 
 static size_t render_frame(Framebuffer *fb, Scene *scene, float t)
 {
+    /* Phase 1 -- streaming. Every explorer claims the chunks within its own
+     * generation radius, and only once ALL of them have claimed does anything
+     * get evicted: dropping after each explorer would throw away chunks the
+     * next one still needs. This phase mutates the shared chunk map, so it
+     * cannot simply be merged into the render loop below. */
+    if (scene->scene == SCENE_CHUNK) {
+        World *world = &scene->worlds[0];
+        world_begin_frame(world);
+        for (int i = 0; i < scene->view_count; i++) {
+            Vec3 eye = camera_position(&scene->views[i].camera, t);
+            world_stream_around(world, eye, scene->views[i].camera.generate_radius);
+        }
+        world_end_frame(world);
+    }
+
+    /* Phase 2 -- rendering. The world is read-only from here on. */
     framebuffer_clear(fb, 0x0E1622);
 
     /* >>> The parallel decomposition lives here: this loop over independent
@@ -216,14 +233,22 @@ static void draw_viewport_borders(Framebuffer *fb, const Scene *scene)
 
 /* Draws the on-screen readout. The FPS number turns red below 30 because that
  * is the floor the project has to hold, so a failing frame rate is visible at a
- * glance instead of having to be read off a number. */
+ * glance instead of having to be read off a number.
+ *
+ * A negative `fps` means "not measured" and renders as dashes. Headless dumps
+ * pass it: a frame rate derived from wall-clock time would differ on every run
+ * and make the byte-identical --dump comparison useless, and a single-frame
+ * reading is meaningless anyway because it includes the initial streaming. */
 static void draw_hud(uint32_t *pixels, int width, int height, const Scene *scene,
                      double fps, size_t triangles, int ssaa)
 {
     char line[128];
     int line_h = OVERLAY_GLYPH_H * HUD_SCALE;
 
-    snprintf(line, sizeof(line), "FPS %.1f", fps);
+    if (fps < 0.0)
+        snprintf(line, sizeof(line), "FPS ---");
+    else
+        snprintf(line, sizeof(line), "FPS %.1f", fps);
     int fps_w = overlay_text_width(line, HUD_SCALE);
 
     char info[128];
@@ -231,15 +256,29 @@ static void draw_hud(uint32_t *pixels, int width, int height, const Scene *scene
              scene->view_count, triangles, ssaa);
     int info_w = overlay_text_width(info, HUD_SCALE);
 
-    int panel_w = (fps_w > info_w ? fps_w : info_w) + 2 * HUD_MARGIN;
-    int panel_h = 2 * line_h + 3 * HUD_MARGIN / 2;
+    char chunks[128];
+    const World *world = &scene->worlds[0];
+    snprintf(chunks, sizeof(chunks), "CHUNKS %zu  NEW %zu  DROPPED %zu",
+             world_chunk_count(world), world->generated_this_frame,
+             world->evicted_this_frame);
+    int chunks_w = overlay_text_width(chunks, HUD_SCALE);
+
+    int widest = fps_w;
+    if (info_w > widest) widest = info_w;
+    if (chunks_w > widest) widest = chunks_w;
+
+    int panel_w = widest + 2 * HUD_MARGIN;
+    int panel_h = 3 * line_h + 2 * HUD_MARGIN;
     overlay_panel(pixels, width, height, 0, 0, panel_w, panel_h, 0x000000, 150);
 
-    uint32_t fps_color = (fps < HUD_MIN_FPS) ? 0xFF5C5C : 0x7CFF9A;
+    uint32_t fps_color = (fps < 0.0) ? 0xD8E4F0
+                       : (fps < HUD_MIN_FPS) ? 0xFF5C5C : 0x7CFF9A;
     overlay_text(pixels, width, height, HUD_MARGIN, HUD_MARGIN / 2,
                  HUD_SCALE, fps_color, line);
     overlay_text(pixels, width, height, HUD_MARGIN, HUD_MARGIN / 2 + line_h + 2,
                  HUD_SCALE, 0xD8E4F0, info);
+    overlay_text(pixels, width, height, HUD_MARGIN, HUD_MARGIN / 2 + 2 * (line_h + 2),
+                 HUD_SCALE, 0x9FC6E8, chunks);
 
     if (scene->view_count < 2)
         return;
@@ -268,7 +307,9 @@ static void print_usage(const char *prog)
 {
     printf("Usage: %s [options]\n", prog);
     printf("  -n, --players N   explorers rendered in split-screen, 1-%d (default 1)\n", MAX_PLAYERS);
-    printf("      --chunks N    world size in chunks per side, 1-%d (default 4)\n", MAX_CHUNKS);
+    printf("      --view N      render distance per explorer, world units (default 96)\n");
+    printf("      --roam N      radius of the flight path, world units (default 320)\n");
+    printf("      --max-chunks N  ceiling on resident chunks (default %d)\n", WORLD_DEFAULT_MAX_CHUNKS);
     printf("      --seed N      terrain seed (default 1337)\n");
     printf("      --width N     window width  (default 960, minimum 640)\n");
     printf("      --height N    window height (default 720, minimum 480)\n");
@@ -319,9 +360,15 @@ static int parse_options(int argc, char **argv, Options *opt)
         if (!strcmp(flag, "--players") || !strcmp(flag, "-n")) {
             if (!parse_int(argv[++i], flag, 1, MAX_PLAYERS, &value)) return -1;
             opt->players = (int)value;
-        } else if (!strcmp(flag, "--chunks")) {
-            if (!parse_int(argv[++i], flag, 1, MAX_CHUNKS, &value)) return -1;
-            opt->chunks = (int)value;
+        } else if (!strcmp(flag, "--view")) {
+            if (!parse_int(argv[++i], flag, 8, 2000, &value)) return -1;
+            opt->view_distance = (float)value;
+        } else if (!strcmp(flag, "--roam")) {
+            if (!parse_int(argv[++i], flag, 0, 100000, &value)) return -1;
+            opt->roam = (float)value;
+        } else if (!strcmp(flag, "--max-chunks")) {
+            if (!parse_int(argv[++i], flag, 64, 200000, &value)) return -1;
+            opt->max_chunks = value;
         } else if (!strcmp(flag, "--seed")) {
             if (!parse_int(argv[++i], flag, 0, 2147483647L, &value)) return -1;
             opt->seed = (unsigned)value;
@@ -411,13 +458,10 @@ static int run_dump(const Options *opt)
     }
     layout_viewports(scene.views, scene.view_count, fb.fb_width, fb.fb_height);
 
-    double t0 = now_seconds();
     size_t count = render_frame(&fb, &scene, 4.0f);
-    double frame_seconds = now_seconds() - t0;
     draw_viewport_borders(&fb, &scene);
     framebuffer_resolve(&fb, resolved);
-    draw_hud(resolved, opt->width, opt->height, &scene,
-             frame_seconds > 0.0 ? 1.0 / frame_seconds : 0.0, count, opt->ssaa);
+    draw_hud(resolved, opt->width, opt->height, &scene, -1.0, count, opt->ssaa);
 
     int ok = write_ppm(opt->dump_path, resolved, opt->width, opt->height);
     if (ok)
@@ -445,9 +489,9 @@ static int run_benchmark(const Options *opt)
     }
     layout_viewports(scene.views, scene.view_count, fb.fb_width, fb.fb_height);
 
-    printf("Benchmark: %dx%d, ssaa=%d (%dx%d internal), players=%d, chunks=%d, frames=%d\n",
+    printf("Benchmark: %dx%d, ssaa=%d (%dx%d internal), players=%d, view=%.0f, frames=%d\n",
            opt->width, opt->height, opt->ssaa, fb.fb_width, fb.fb_height,
-           opt->players, opt->chunks, opt->bench_frames);
+           opt->players, (double)opt->view_distance, opt->bench_frames);
 
     size_t last_total = 0;
     double start = now_seconds();
@@ -459,6 +503,8 @@ static int run_benchmark(const Options *opt)
     printf("Triangles:  %zu (last frame, all views)\n", last_total);
     for (int i = 0; i < scene.view_count; i++)
         printf("  view %d: %zu triangles\n", i, scene.views[i].triangle_count);
+    printf("Chunks:     %zu resident, %zu generated on the last frame\n",
+           world_chunk_count(&scene.worlds[0]), scene.worlds[0].generated_this_frame);
     printf("Total:      %.4f s\n", elapsed);
     printf("Per frame:  %.4f ms  (%.2f FPS)\n", per_frame_ms, 1000.0 / per_frame_ms);
 
@@ -571,7 +617,8 @@ static int run_interactive(const Options *opt)
 
 int main(int argc, char **argv)
 {
-    Options opt = { 960, 720, 1, 1, 4, 1337u, 0, SCENE_CHUNK, 0, NULL };
+    Options opt = { 960, 720, 1, 1, 96.0f, 320.0f, WORLD_DEFAULT_MAX_CHUNKS,
+                    1337u, 0, SCENE_CHUNK, 0, NULL };
 
     textures_init();
 

@@ -48,16 +48,24 @@ Mat4 camera_view_proj(const Camera *camera, float t, float aspect)
     return mat4_mul(proj, view);
 }
 
-Camera camera_make(int index, int count, float world_extent, float terrain_height)
+Camera camera_make(int index, int count, float roam_radius,
+                   float view_distance, float flight_height)
 {
     if (count < 1) count = 1;
+    if (roam_radius < 1.0f) roam_radius = 1.0f;
+    if (view_distance < 1.0f) view_distance = 1.0f;
 
     Camera camera;
-    float span = world_extent * 0.5f;
 
-    camera.center = vec3_make(0.0f, 0.0f, 0.0f);
-    camera.radius_x = span * 0.62f;
-    camera.radius_z = span * 0.62f;
+    /* Explorers are spread over a ring so they do not all stream the same
+     * chunks: with overlapping paths the terrain would be generated once and
+     * shared, which hides the real cost of streaming for N explorers. */
+    float slot = (float)index / (float)count * 2.0f * CAMERA_PI;
+    camera.center = vec3_make(roam_radius * 1.15f * cosf(slot),
+                              0.0f,
+                              roam_radius * 1.15f * sinf(slot));
+    camera.radius_x = roam_radius;
+    camera.radius_z = roam_radius * 0.72f;
 
     /* Spread the explorers evenly around their paths so they start apart. */
     float share = (float)index / (float)count;
@@ -70,9 +78,7 @@ Camera camera_make(int index, int count, float world_extent, float terrain_heigh
     camera.rate_x = 0.085f;
     camera.rate_z = 0.052f;
 
-    /* terrain_height is the highest ground the generator can produce, so this
-     * clears the peaks with margin even at the bottom of the bob. */
-    camera.height = terrain_height + 8.0f;
+    camera.height = flight_height;
     camera.bob_amplitude = 3.5f;
     camera.bob_rate = 0.9f;
 
@@ -81,7 +87,8 @@ Camera camera_make(int index, int count, float world_extent, float terrain_heigh
      * load imbalance that makes OpenMP scheduling policy matter. */
     camera.speed = 1.0f + 0.35f * (float)index;
     camera.fov_y_rad = 65.0f * CAMERA_PI / 180.0f;
-    camera.view_distance = world_extent * (0.55f + 0.18f * (float)(index % 3));
+    camera.view_distance = view_distance * (1.0f + 0.25f * (float)(index % 3));
+    camera.generate_radius = camera.view_distance * CAMERA_STREAM_FACTOR;
 
     return camera;
 }

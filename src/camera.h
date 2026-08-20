@@ -31,12 +31,22 @@ typedef struct {
 
     float speed;        /* multiplies every rate: the "how fast" knob */
     float fov_y_rad;
-    float view_distance;/* how far this explorer can see; drives its render load */
+    float view_distance;    /* how far this explorer can see: its render load */
+    float generate_radius;  /* how far ahead terrain is generated */
 } Camera;
 
-/* Builds explorer `index` of `count`, spread over the world so their paths do
- * not overlap and each one gets its own speed. */
-Camera camera_make(int index, int count, float world_extent, float terrain_height);
+/* Terrain is generated out to this multiple of an explorer's view distance.
+ *
+ * It must be comfortably greater than 1. Face culling at the edge of the
+ * rendered region needs the neighbouring chunk to already exist, and an
+ * explorer moving at speed would otherwise fly into chunks that are still being
+ * generated. The margin buys both. */
+#define CAMERA_STREAM_FACTOR 2.5f
+
+/* Builds explorer `index` of `count`, spread over the roaming area so their
+ * paths do not overlap and each one gets its own speed and view distance. */
+Camera camera_make(int index, int count, float roam_radius,
+                   float view_distance, float flight_height);
 
 /* Where the camera is at time `t`, in world units. */
 Vec3 camera_position(const Camera *camera, float t);

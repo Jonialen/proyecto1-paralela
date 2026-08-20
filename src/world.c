@@ -17,6 +17,25 @@
 #define ID_SNOW    block_id_from_index(9)
 #define ID_LEAVES  block_id_from_index(10)
 
+/* Integer floor division and non-negative modulo. Plain / and % truncate
+ * towards zero, which puts world x = -1 in chunk 0 instead of chunk -1 and
+ * tears the terrain along both negative axes. */
+static int floor_div(int a, int b)
+{
+    int q = a / b;
+    if ((a % b != 0) && ((a < 0) != (b < 0)))
+        q--;
+    return q;
+}
+
+static int mod_floor(int a, int b)
+{
+    int m = a % b;
+    if (m < 0)
+        m += b;
+    return m;
+}
+
 /* ------------------------------------------------------------------ chunk */
 
 static int chunk_index(int x, int y, int z)
@@ -38,7 +57,7 @@ void chunk_clear(Chunk *chunk)
 
 uint8_t chunk_get(const Chunk *chunk, int x, int y, int z)
 {
-    if (!chunk_in_bounds(x, y, z))
+    if (!chunk || !chunk_in_bounds(x, y, z))
         return BLOCK_AIR;
     return chunk->blocks[chunk_index(x, y, z)];
 }
@@ -50,68 +69,13 @@ void chunk_set(Chunk *chunk, int x, int y, int z, uint8_t id)
     chunk->blocks[chunk_index(x, y, z)] = id;
 }
 
-unsigned chunk_face_mask(const Chunk *chunk, int x, int y, int z)
-{
-    unsigned mask = 0;
-    if (chunk_get(chunk, x + 1, y, z) == BLOCK_AIR) mask |= FACE_POS_X;
-    if (chunk_get(chunk, x - 1, y, z) == BLOCK_AIR) mask |= FACE_NEG_X;
-    if (chunk_get(chunk, x, y + 1, z) == BLOCK_AIR) mask |= FACE_POS_Y;
-    if (chunk_get(chunk, x, y - 1, z) == BLOCK_AIR) mask |= FACE_NEG_Y;
-    if (chunk_get(chunk, x, y, z + 1) == BLOCK_AIR) mask |= FACE_POS_Z;
-    if (chunk_get(chunk, x, y, z - 1) == BLOCK_AIR) mask |= FACE_NEG_Z;
-    return mask;
-}
-
-/* Shared tail of chunk_emit()/world_emit(): one solid block becomes up to six
- * faces of geometry. */
-static size_t emit_block(TriangleBuffer *out, uint8_t id, unsigned mask,
-                         Vec3 origin, int x, int y, int z,
-                         Mat4 vp, Vec3 light_dir, const Viewport *view)
-{
-    const Block *block = block_from_id(id);
-    if (!block)
-        return 0;
-
-    /* Blocks are axis-aligned, so the model matrix is a pure translation to the
-     * centre of the voxel cell. */
-    Mat4 model = mat4_translate(origin.x + (float)x + 0.5f,
-                                origin.y + (float)y + 0.5f,
-                                origin.z + (float)z + 0.5f);
-    return cube_emit(out, block, model, vp, light_dir, mask, view);
-}
-
-size_t chunk_emit(TriangleBuffer *out, const Chunk *chunk, Vec3 origin,
-                  Mat4 vp, Vec3 light_dir, const Viewport *view)
-{
-    size_t emitted = 0;
-
-    for (int y = 0; y < CHUNK_SIZE_Y; y++) {
-        for (int z = 0; z < CHUNK_SIZE_Z; z++) {
-            for (int x = 0; x < CHUNK_SIZE_X; x++) {
-                uint8_t id = chunk->blocks[chunk_index(x, y, z)];
-                if (id == BLOCK_AIR)
-                    continue;
-
-                unsigned mask = chunk_face_mask(chunk, x, y, z);
-                if (mask == 0)
-                    continue; /* fully buried, nothing to draw */
-
-                emitted += emit_block(out, id, mask, origin, x, y, z,
-                                      vp, light_dir, view);
-            }
-        }
-    }
-
-    return emitted;
-}
-
 /* ------------------------------------------------------ terrain generation */
 
 TerrainParams terrain_default(uint32_t seed)
 {
     TerrainParams p;
     p.seed = seed;
-    p.scale = 26.0f;
+    p.scale = 34.0f;
     p.octaves = 4;
     p.lacunarity = 2.0f;
     p.gain = 0.5f;
@@ -123,6 +87,11 @@ TerrainParams terrain_default(uint32_t seed)
     return p;
 }
 
+float terrain_peak(const TerrainParams *params)
+{
+    return params->base_height + params->amplitude;
+}
+
 int terrain_height(const TerrainParams *params, int world_x, int world_z)
 {
     float n = noise_fbm_2d((float)world_x / params->scale,
@@ -130,8 +99,8 @@ int terrain_height(const TerrainParams *params, int world_x, int world_z)
                            params->seed, params->octaves,
                            params->lacunarity, params->gain);
 
-    /* Squaring biases the distribution towards low ground, which reads as
-     * broad valleys with a few distinct peaks rather than uniform lumpiness. */
+    /* Biases the distribution towards low ground, which reads as broad valleys
+     * with a few distinct peaks rather than uniform lumpiness. */
     n = n * n * (3.0f - 2.0f * n);
 
     int height = (int)(params->base_height + n * params->amplitude);
@@ -140,7 +109,6 @@ int terrain_height(const TerrainParams *params, int world_x, int world_z)
     return height;
 }
 
-/* Picks the block for one cell of a column, given the column's surface height. */
 static uint8_t terrain_block(const TerrainParams *params, int y, int height,
                              int world_x, int world_z)
 {
@@ -151,14 +119,12 @@ static uint8_t terrain_block(const TerrainParams *params, int y, int height,
         if (height <= params->sand_level) return ID_SAND;
         return ID_GRASS;
     }
-
     if (depth <= 3) {
         if (height >= params->snow_level) return ID_STONE;
         if (height <= params->sand_level) return ID_SAND;
         return ID_DIRT;
     }
 
-    /* Ore pockets scattered deterministically through the stone. */
     float r = noise_hash_3d(world_x, y, world_z, params->seed + 5501u);
     if (y < 6 && r > 0.988f) return ID_GOLD;
     if (y < 4 && r < 0.008f) return ID_DIAMOND;
@@ -166,8 +132,9 @@ static uint8_t terrain_block(const TerrainParams *params, int y, int height,
     return ID_STONE;
 }
 
-/* Small oak: a trunk with a two-layer canopy. Placed only on grass so trees
- * never sprout out of sand or snow. */
+/* Small oak: a trunk with a two-layer canopy. Canopy blocks that fall outside
+ * the chunk are clipped by chunk_set, so trees on a chunk seam lose part of
+ * their crown -- the usual cost of generating chunks independently. */
 static void place_tree(Chunk *chunk, int x, int height, int z)
 {
     int trunk = 4 + (height % 2);
@@ -182,11 +149,10 @@ static void place_tree(Chunk *chunk, int x, int height, int z)
         int radius = (dy == 0) ? 1 : 2;
         for (int dz = -radius; dz <= radius; dz++) {
             for (int dx = -radius; dx <= radius; dx++) {
-                /* Clip the corners so the canopy is round-ish, not a cube. */
                 if (dx * dx + dz * dz > radius * radius + 1)
                     continue;
                 if (dx == 0 && dz == 0 && dy < 0)
-                    continue; /* leave room for the trunk */
+                    continue;
                 if (chunk_get(chunk, x + dx, top + dy, z + dz) == BLOCK_AIR)
                     chunk_set(chunk, x + dx, top + dy, z + dz, ID_LEAVES);
             }
@@ -202,8 +168,8 @@ void chunk_generate(Chunk *chunk, const TerrainParams *params,
 
     for (int z = 0; z < CHUNK_SIZE_Z; z++) {
         for (int x = 0; x < CHUNK_SIZE_X; x++) {
-            /* World coordinates, not chunk-local: this is the whole reason
-             * adjacent chunks join up instead of each being its own island. */
+            /* World coordinates, not chunk-local: this is what makes a chunk
+             * generated on its own line up with neighbours generated later. */
             int world_x = chunk_x * CHUNK_SIZE_X + x;
             int world_z = chunk_z * CHUNK_SIZE_Z + z;
             int height = terrain_height(params, world_x, world_z);
@@ -219,37 +185,127 @@ void chunk_generate(Chunk *chunk, const TerrainParams *params,
     }
 }
 
-/* ------------------------------------------------------------------- world */
+/* --------------------------------------------------------------- chunk map */
 
-int world_init(World *world, int size, const TerrainParams *params)
+static size_t chunk_hash(int cx, int cz)
 {
-    if (size < 1) size = 1;
-    world->size = size;
-    world->params = *params;
-    world->chunks = calloc((size_t)size * size, sizeof(Chunk));
-    if (!world->chunks)
+    uint32_t h = (uint32_t)cx * 73856093u ^ (uint32_t)cz * 19349663u;
+    h = (h ^ (h >> 15)) * 2246822519u;
+    return (size_t)(h ^ (h >> 13));
+}
+
+int world_init(World *world, const TerrainParams *params, size_t max_chunks)
+{
+    memset(world, 0, sizeof(*world));
+    world->capacity = 1024; /* power of two, grows as needed */
+    world->slots = calloc(world->capacity, sizeof(ChunkSlot));
+    if (!world->slots)
         return 0;
 
-    /* Centre the world on the origin so the orbit camera needs no offset. */
-    world->origin = vec3_make(-0.5f * (float)(size * CHUNK_SIZE_X),
-                              -(params->base_height + params->amplitude * 0.45f),
-                              -0.5f * (float)(size * CHUNK_SIZE_Z));
+    world->params = *params;
+    world->max_chunks = max_chunks ? max_chunks : WORLD_DEFAULT_MAX_CHUNKS;
+    world->frame = 1;
     return 1;
 }
 
 void world_free(World *world)
 {
-    free(world->chunks);
-    world->chunks = NULL;
-    world->size = 0;
+    if (world->slots) {
+        for (size_t i = 0; i < world->capacity; i++)
+            if (world->slots[i].state == CHUNK_SLOT_USED)
+                free(world->slots[i].chunk);
+        free(world->slots);
+    }
+    memset(world, 0, sizeof(*world));
 }
 
-void world_generate(World *world)
+size_t world_chunk_count(const World *world)
 {
-    for (int cz = 0; cz < world->size; cz++)
-        for (int cx = 0; cx < world->size; cx++)
-            chunk_generate(&world->chunks[cz * world->size + cx],
-                           &world->params, cx, cz);
+    return world->used;
+}
+
+/* Returns the slot holding (cx, cz), or NULL. */
+static ChunkSlot *world_lookup(const World *world, int cx, int cz)
+{
+    size_t mask = world->capacity - 1;
+    size_t i = chunk_hash(cx, cz) & mask;
+
+    for (size_t probe = 0; probe < world->capacity; probe++) {
+        ChunkSlot *slot = &world->slots[i];
+        if (slot->state == CHUNK_SLOT_EMPTY)
+            return NULL; /* a never-used slot ends the probe chain */
+        if (slot->state == CHUNK_SLOT_USED && slot->cx == cx && slot->cz == cz)
+            return slot;
+        i = (i + 1) & mask; /* linear probing */
+    }
+    return NULL;
+}
+
+const Chunk *world_find_chunk(const World *world, int cx, int cz)
+{
+    ChunkSlot *slot = world_lookup(world, cx, cz);
+    return slot ? slot->chunk : NULL;
+}
+
+/* Reinserts every live chunk into a fresh table, clearing tombstones. */
+static int world_rehash(World *world, size_t new_capacity)
+{
+    ChunkSlot *fresh = calloc(new_capacity, sizeof(ChunkSlot));
+    if (!fresh)
+        return 0;
+
+    size_t mask = new_capacity - 1;
+    for (size_t i = 0; i < world->capacity; i++) {
+        ChunkSlot *old = &world->slots[i];
+        if (old->state != CHUNK_SLOT_USED)
+            continue;
+        size_t j = chunk_hash(old->cx, old->cz) & mask;
+        while (fresh[j].state == CHUNK_SLOT_USED)
+            j = (j + 1) & mask;
+        fresh[j] = *old;
+    }
+
+    free(world->slots);
+    world->slots = fresh;
+    world->capacity = new_capacity;
+    world->tombstones = 0;
+    return 1;
+}
+
+/* Inserts a freshly generated chunk. Takes ownership of `chunk`. */
+static int world_insert(World *world, int cx, int cz, Chunk *chunk)
+{
+    /* Keep the load factor under 0.7; tombstones count because they lengthen
+     * probe chains just as much as live entries do. */
+    if ((world->used + world->tombstones + 1) * 10 >= world->capacity * 7) {
+        if (!world_rehash(world, world->capacity * 2))
+            return 0;
+    }
+
+    size_t mask = world->capacity - 1;
+    size_t i = chunk_hash(cx, cz) & mask;
+    while (world->slots[i].state == CHUNK_SLOT_USED)
+        i = (i + 1) & mask;
+
+    if (world->slots[i].state == CHUNK_SLOT_DEAD)
+        world->tombstones--;
+
+    world->slots[i].cx = cx;
+    world->slots[i].cz = cz;
+    world->slots[i].state = CHUNK_SLOT_USED;
+    world->slots[i].touch = world->frame;
+    world->slots[i].chunk = chunk;
+    world->used++;
+    return 1;
+}
+
+static void world_drop_slot(World *world, ChunkSlot *slot)
+{
+    free(slot->chunk);
+    slot->chunk = NULL;
+    slot->state = CHUNK_SLOT_DEAD;
+    world->used--;
+    world->tombstones++;
 }
 
 uint8_t world_get(const World *world, int x, int y, int z)
@@ -257,47 +313,217 @@ uint8_t world_get(const World *world, int x, int y, int z)
     if (y < 0 || y >= CHUNK_SIZE_Y)
         return BLOCK_AIR;
 
-    int cx = x / CHUNK_SIZE_X;
-    int cz = z / CHUNK_SIZE_Z;
-    if (x < 0 || z < 0 || cx >= world->size || cz >= world->size)
+    const Chunk *chunk = world_find_chunk(world,
+                                          floor_div(x, CHUNK_SIZE_X),
+                                          floor_div(z, CHUNK_SIZE_Z));
+    if (!chunk)
         return BLOCK_AIR;
 
-    const Chunk *chunk = &world->chunks[cz * world->size + cx];
-    return chunk->blocks[chunk_index(x % CHUNK_SIZE_X, y, z % CHUNK_SIZE_Z)];
+    return chunk->blocks[chunk_index(mod_floor(x, CHUNK_SIZE_X), y,
+                                     mod_floor(z, CHUNK_SIZE_Z))];
 }
 
-static unsigned world_face_mask(const World *world, int x, int y, int z)
+/* --------------------------------------------------------------- streaming */
+
+void world_begin_frame(World *world)
+{
+    world->frame++;
+    world->generated_this_frame = 0;
+    world->evicted_this_frame = 0;
+}
+
+size_t world_stream_around(World *world, Vec3 center, float generate_radius)
+{
+    if (generate_radius <= 0.0f)
+        return 0;
+
+    int center_cx = floor_div((int)floorf(center.x), CHUNK_SIZE_X);
+    int center_cz = floor_div((int)floorf(center.z), CHUNK_SIZE_Z);
+    int reach = (int)ceilf(generate_radius / (float)CHUNK_SIZE_X);
+    float radius_sq = generate_radius * generate_radius;
+
+    size_t generated = 0;
+    for (int dz = -reach; dz <= reach; dz++) {
+        for (int dx = -reach; dx <= reach; dx++) {
+            int cx = center_cx + dx;
+            int cz = center_cz + dz;
+
+            /* Disk, not square: the corners of the square are up to 41% further
+             * out and would cost 27% more chunks for terrain nobody reaches. */
+            float ox = ((float)cx + 0.5f) * CHUNK_SIZE_X - center.x;
+            float oz = ((float)cz + 0.5f) * CHUNK_SIZE_Z - center.z;
+            if (ox * ox + oz * oz > radius_sq)
+                continue;
+
+            ChunkSlot *slot = world_lookup(world, cx, cz);
+            if (slot) {
+                slot->touch = world->frame; /* still needed, keep it alive */
+                continue;
+            }
+
+            Chunk *chunk = malloc(sizeof(Chunk));
+            if (!chunk)
+                return generated; /* out of memory: stop growing, keep running */
+
+            chunk_generate(chunk, &world->params, cx, cz);
+            if (!world_insert(world, cx, cz, chunk)) {
+                free(chunk);
+                return generated;
+            }
+            generated++;
+        }
+    }
+
+    world->generated_this_frame += generated;
+    return generated;
+}
+
+size_t world_end_frame(World *world)
+{
+    size_t evicted = 0;
+
+    /* Grace period: a chunk right at the generation boundary would otherwise
+     * be dropped and regenerated on alternating frames as an explorer skims
+     * past it. */
+    for (size_t i = 0; i < world->capacity; i++) {
+        ChunkSlot *slot = &world->slots[i];
+        if (slot->state != CHUNK_SLOT_USED)
+            continue;
+        if (slot->touch + WORLD_EVICT_GRACE_FRAMES < world->frame) {
+            world_drop_slot(world, slot);
+            evicted++;
+        }
+    }
+
+    /* Hard ceiling, so a fast explorer cannot grow the resident set without
+     * bound before the grace period expires. Drops the least recently needed. */
+    while (world->used > world->max_chunks) {
+        ChunkSlot *oldest = NULL;
+        for (size_t i = 0; i < world->capacity; i++) {
+            ChunkSlot *slot = &world->slots[i];
+            if (slot->state != CHUNK_SLOT_USED)
+                continue;
+            if (slot->touch == world->frame)
+                continue; /* needed right now, never evict */
+            if (!oldest || slot->touch < oldest->touch)
+                oldest = slot;
+        }
+        if (!oldest)
+            break; /* everything resident is in use this frame */
+        world_drop_slot(world, oldest);
+        evicted++;
+    }
+
+    world->evicted_this_frame = evicted;
+    return evicted;
+}
+
+/* --------------------------------------------------------------- rendering */
+
+/* The four horizontal neighbours of one chunk, resolved once so face masking
+ * does not pay a hash lookup per block per side. */
+typedef struct {
+    const Chunk *neg_x, *pos_x, *neg_z, *pos_z;
+} ChunkNeighbors;
+
+/* Faces whose neighbour is air. A missing neighbour chunk counts as SOLID: it
+ * only happens outside the generation radius, and treating it as air would
+ * draw a wall of faces along the edge of the loaded region. */
+static unsigned face_mask_at(const Chunk *chunk, const ChunkNeighbors *n,
+                             int x, int y, int z)
 {
     unsigned mask = 0;
-    if (world_get(world, x + 1, y, z) == BLOCK_AIR) mask |= FACE_POS_X;
-    if (world_get(world, x - 1, y, z) == BLOCK_AIR) mask |= FACE_NEG_X;
-    if (world_get(world, x, y + 1, z) == BLOCK_AIR) mask |= FACE_POS_Y;
-    if (world_get(world, x, y - 1, z) == BLOCK_AIR) mask |= FACE_NEG_Y;
-    if (world_get(world, x, y, z + 1) == BLOCK_AIR) mask |= FACE_POS_Z;
-    if (world_get(world, x, y, z - 1) == BLOCK_AIR) mask |= FACE_NEG_Z;
+
+    if (x + 1 < CHUNK_SIZE_X) {
+        if (chunk->blocks[chunk_index(x + 1, y, z)] == BLOCK_AIR) mask |= FACE_POS_X;
+    } else if (n->pos_x && chunk_get(n->pos_x, 0, y, z) == BLOCK_AIR) {
+        mask |= FACE_POS_X;
+    }
+
+    if (x - 1 >= 0) {
+        if (chunk->blocks[chunk_index(x - 1, y, z)] == BLOCK_AIR) mask |= FACE_NEG_X;
+    } else if (n->neg_x && chunk_get(n->neg_x, CHUNK_SIZE_X - 1, y, z) == BLOCK_AIR) {
+        mask |= FACE_NEG_X;
+    }
+
+    if (z + 1 < CHUNK_SIZE_Z) {
+        if (chunk->blocks[chunk_index(x, y, z + 1)] == BLOCK_AIR) mask |= FACE_POS_Z;
+    } else if (n->pos_z && chunk_get(n->pos_z, x, y, 0) == BLOCK_AIR) {
+        mask |= FACE_POS_Z;
+    }
+
+    if (z - 1 >= 0) {
+        if (chunk->blocks[chunk_index(x, y, z - 1)] == BLOCK_AIR) mask |= FACE_NEG_Z;
+    } else if (n->neg_z && chunk_get(n->neg_z, x, y, CHUNK_SIZE_Z - 1) == BLOCK_AIR) {
+        mask |= FACE_NEG_Z;
+    }
+
+    /* Y has no neighbouring chunk: above the top and below the bottom is air. */
+    if (y + 1 >= CHUNK_SIZE_Y || chunk->blocks[chunk_index(x, y + 1, z)] == BLOCK_AIR)
+        mask |= FACE_POS_Y;
+    if (y - 1 < 0 || chunk->blocks[chunk_index(x, y - 1, z)] == BLOCK_AIR)
+        mask |= FACE_NEG_Y;
+
     return mask;
 }
 
-size_t world_emit(TriangleBuffer *out, const World *world, Mat4 vp,
-                  Vec3 light_dir, const Viewport *view)
+size_t world_emit_view(TriangleBuffer *out, const World *world, Vec3 camera_pos,
+                       float render_radius, Mat4 vp, Vec3 light_dir,
+                       const Viewport *view)
 {
+    int center_cx = floor_div((int)floorf(camera_pos.x), CHUNK_SIZE_X);
+    int center_cz = floor_div((int)floorf(camera_pos.z), CHUNK_SIZE_Z);
+    int reach = (int)ceilf(render_radius / (float)CHUNK_SIZE_X);
+    float radius_sq = render_radius * render_radius;
+
     size_t emitted = 0;
-    int span_x = world->size * CHUNK_SIZE_X;
-    int span_z = world->size * CHUNK_SIZE_Z;
 
-    for (int y = 0; y < CHUNK_SIZE_Y; y++) {
-        for (int z = 0; z < span_z; z++) {
-            for (int x = 0; x < span_x; x++) {
-                uint8_t id = world_get(world, x, y, z);
-                if (id == BLOCK_AIR)
-                    continue;
+    /* Sorted box scan: the visit order depends only on the camera position, not
+     * on hash layout or load history, so two runs emit triangles in the same
+     * order and produce byte-identical frames. */
+    for (int cz = center_cz - reach; cz <= center_cz + reach; cz++) {
+        for (int cx = center_cx - reach; cx <= center_cx + reach; cx++) {
+            float ox = ((float)cx + 0.5f) * CHUNK_SIZE_X - camera_pos.x;
+            float oz = ((float)cz + 0.5f) * CHUNK_SIZE_Z - camera_pos.z;
+            if (ox * ox + oz * oz > radius_sq)
+                continue;
 
-                unsigned mask = world_face_mask(world, x, y, z);
-                if (mask == 0)
-                    continue;
+            const Chunk *chunk = world_find_chunk(world, cx, cz);
+            if (!chunk)
+                continue;
 
-                emitted += emit_block(out, id, mask, world->origin, x, y, z,
-                                      vp, light_dir, view);
+            ChunkNeighbors neighbors = {
+                world_find_chunk(world, cx - 1, cz),
+                world_find_chunk(world, cx + 1, cz),
+                world_find_chunk(world, cx, cz - 1),
+                world_find_chunk(world, cx, cz + 1)
+            };
+
+            float base_x = (float)cx * CHUNK_SIZE_X;
+            float base_z = (float)cz * CHUNK_SIZE_Z;
+
+            for (int y = 0; y < CHUNK_SIZE_Y; y++) {
+                for (int z = 0; z < CHUNK_SIZE_Z; z++) {
+                    for (int x = 0; x < CHUNK_SIZE_X; x++) {
+                        uint8_t id = chunk->blocks[chunk_index(x, y, z)];
+                        if (id == BLOCK_AIR)
+                            continue;
+
+                        unsigned mask = face_mask_at(chunk, &neighbors, x, y, z);
+                        if (mask == 0)
+                            continue; /* fully buried */
+
+                        const Block *block = block_from_id(id);
+                        if (!block)
+                            continue;
+
+                        Mat4 model = mat4_translate(base_x + (float)x + 0.5f,
+                                                    (float)y + 0.5f,
+                                                    base_z + (float)z + 0.5f);
+                        emitted += cube_emit(out, block, model, vp, light_dir,
+                                             mask, view);
+                    }
+                }
             }
         }
     }
@@ -308,10 +534,13 @@ size_t world_emit(TriangleBuffer *out, const World *world, Mat4 vp,
 size_t world_solid_blocks(const World *world)
 {
     size_t solid = 0;
-    size_t chunks = (size_t)world->size * world->size;
-    for (size_t c = 0; c < chunks; c++)
-        for (int i = 0; i < CHUNK_VOLUME; i++)
-            if (world->chunks[c].blocks[i] != BLOCK_AIR)
+    for (size_t i = 0; i < world->capacity; i++) {
+        if (world->slots[i].state != CHUNK_SLOT_USED)
+            continue;
+        const Chunk *chunk = world->slots[i].chunk;
+        for (int j = 0; j < CHUNK_VOLUME; j++)
+            if (chunk->blocks[j] != BLOCK_AIR)
                 solid++;
+    }
     return solid;
 }
