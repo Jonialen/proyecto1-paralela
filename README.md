@@ -10,6 +10,14 @@ SDL2 is used only to open a window and blit the finished framebuffer.
 This is the **sequential** version — the baseline the parallel version is
 measured against.
 
+## Documentation
+
+| File | Contents |
+|---|---|
+| `docs/matematica.md` | The maths behind each pipeline stage and why it is that way |
+| `docs/decisiones.md` | Design decision record: what, why, alternatives, consequences |
+| `AGENTS.md` | Working practices, invariants and the determinism contract |
+
 ## Build and run
 
 ```sh

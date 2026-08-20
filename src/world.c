@@ -99,8 +99,9 @@ int terrain_height(const TerrainParams *params, int world_x, int world_z)
                            params->seed, params->octaves,
                            params->lacunarity, params->gain);
 
-    /* Biases the distribution towards low ground, which reads as broad valleys
-     * with a few distinct peaks rather than uniform lumpiness. */
+    /* Smoothstep applied to the noise itself. It is symmetric: it flattens both
+     * extremes and steepens the middle, where fBm output clusters. The result
+     * is more contrast between valleys and ridges, not a downward bias. */
     n = n * n * (3.0f - 2.0f * n);
 
     int height = (int)(params->base_height + n * params->amplitude);

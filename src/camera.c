@@ -73,8 +73,10 @@ Camera camera_make(int index, int count, float roam_radius,
     camera.phase_z = share * 2.0f * CAMERA_PI + CAMERA_PI * 0.5f;
     camera.phase_y = share * 2.0f * CAMERA_PI;
 
-    /* Slightly irrational rate ratio: the figure-eight never exactly repeats,
-     * so the explorer keeps covering new ground. */
+    /* The path closes only when both sines complete whole cycles. The ratio
+     * 0.085 / 0.052 = 85/52 is already in lowest terms, so that takes
+     * 2*pi*1000 = 6283 s of path time -- about an hour and three quarters at
+     * speed 1. Long enough that the explorer never visibly retraces itself. */
     camera.rate_x = 0.085f;
     camera.rate_z = 0.052f;
 
