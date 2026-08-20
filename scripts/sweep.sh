@@ -1,17 +1,29 @@
 #!/usr/bin/env bash
-# Sequential baseline sweep: geometry load (--chunks) x pixel load (--ssaa).
+# Sequential baseline sweep. Each point runs an untimed warmup first, so the
+# initial chunk streaming is not averaged into the steady-state figure.
 set -u
-printf "%-7s %-6s %-10s %-12s %-12s %-12s %-9s\n" chunks ssaa tris frame_ms geom_ms raster_ms raster%
-for c in 1 2 4 8; do
-  for s in 1 2 4; do
-    frames=$(( 120 / (s*s) )); [ $frames -lt 8 ] && frames=8
-    out=$(./cubeview --scene chunk --chunks $c --width 1280 --height 720 \
-                     --ssaa $s --bench $frames 2>/dev/null)
-    tris=$(echo   "$out" | rg -o 'Triangles:\s+(\d+)'        -r '$1')
-    frame=$(echo  "$out" | rg -o 'Per frame:\s+([\d.]+)'     -r '$1')
-    geom=$(echo   "$out" | rg -o 'geometry:\s+([\d.]+)'      -r '$1')
-    rast=$(echo   "$out" | rg -o 'raster:\s+([\d.]+)'        -r '$1')
-    pct=$(echo    "$out" | rg -o 'raster:.*\(([\d.]+)%\)'    -r '$1')
-    printf "%-7s %-6s %-10s %-12s %-12s %-12s %-9s\n" "$c" "$s" "$tris" "$frame" "$geom" "$rast" "$pct"
-  done
-done
+
+BIN=${BIN:-./cubeview}
+W=${W:-960}
+H=${H:-720}
+
+run() { # players view ssaa frames
+  local n=$1 v=$2 s=$3 f=$4
+  local out
+  out=$($BIN -n "$n" --view "$v" --ssaa "$s" --width $W --height $H \
+             --warmup 4 --bench "$f" 2>/dev/null)
+  printf "%-4s %-6s %-6s %-10s %-8s %-11s %-8s\n" \
+    "$n" "$v" "$s" \
+    "$(echo "$out" | rg -o 'Triangles:\s+(\d+)'    -r '$1')" \
+    "$(echo "$out" | rg -o 'Chunks:\s+(\d+)'       -r '$1')" \
+    "$(echo "$out" | rg -o 'Per frame:\s+([\d.]+)' -r '$1')" \
+    "$(echo "$out" | rg -o '\(([\d.]+) FPS\)'      -r '$1')"
+}
+
+printf "%-4s %-6s %-6s %-10s %-8s %-11s %-8s\n" N view ssaa tris chunks frame_ms FPS
+echo "-- explorers (N) --"
+for n in 1 2 4 8 16; do run "$n" 96 1 12; done
+echo "-- render distance --"
+for v in 48 96 160; do run 4 "$v" 1 12; done
+echo "-- supersampling --"
+for s in 1 2 4; do run 4 96 "$s" 8; done

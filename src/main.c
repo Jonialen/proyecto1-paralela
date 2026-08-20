@@ -155,11 +155,23 @@ static int scene_init(Scene *scene, const Options *opt)
 
 /* --------------------------------------------------------------- rendering */
 
+/* Per-stage wall clock for one frame. The three stages scale with different
+ * inputs and parallelize differently, so the split is what tells you where to
+ * spend effort -- a single frame time hides all of it. */
+typedef struct {
+    double stream;   /* generating and evicting chunks */
+    double geometry; /* transform, cull, clip, project */
+    double raster;   /* per-pixel fill, depth test, texturing */
+} FrameTimings;
+
 /* Renders one view. Everything it touches is private to that view or read-only,
  * which is what makes the loop over views safe to run in parallel. */
-static void render_view(Framebuffer *fb, ViewTask *view, const Scene *scene, float t)
+static void render_view(Framebuffer *fb, ViewTask *view, const Scene *scene, float t,
+                        FrameTimings *timings)
 {
     Mat4 vp = camera_view_proj(&view->camera, t, viewport_aspect(&view->viewport));
+
+    double t0 = timings ? now_seconds() : 0.0;
 
     tribuf_clear(&view->triangles);
     if (scene->scene == SCENE_CHUNK) {
@@ -172,11 +184,21 @@ static void render_view(Framebuffer *fb, ViewTask *view, const Scene *scene, flo
                                          mat4_identity(), vp, scene->light,
                                          FACE_ALL, &view->viewport);
     }
+
+    double t1 = timings ? now_seconds() : 0.0;
     raster_flush(fb, &view->triangles);
+
+    if (timings) {
+        double t2 = now_seconds();
+        timings->geometry += t1 - t0;
+        timings->raster += t2 - t1;
+    }
 }
 
-static size_t render_frame(Framebuffer *fb, Scene *scene, float t)
+static size_t render_frame(Framebuffer *fb, Scene *scene, float t, FrameTimings *timings)
 {
+    double stream_start = timings ? now_seconds() : 0.0;
+
     /* Phase 1 -- streaming. Every explorer claims the chunks within its own
      * generation radius, and only once ALL of them have claimed does anything
      * get evicted: dropping after each explorer would throw away chunks the
@@ -191,6 +213,8 @@ static size_t render_frame(Framebuffer *fb, Scene *scene, float t)
         }
         world_end_frame(world);
     }
+    if (timings)
+        timings->stream += now_seconds() - stream_start;
 
     /* Phase 2 -- rendering. The world is read-only from here on. */
     framebuffer_clear(fb, 0x0E1622);
@@ -198,7 +222,7 @@ static size_t render_frame(Framebuffer *fb, Scene *scene, float t)
     /* >>> The parallel decomposition lives here: this loop over independent
      * views is the one that becomes an OpenMP parallel for. <<< */
     for (int i = 0; i < scene->view_count; i++)
-        render_view(fb, &scene->views[i], scene, t);
+        render_view(fb, &scene->views[i], scene, t, timings);
 
     size_t total = 0;
     for (int i = 0; i < scene->view_count; i++)
@@ -469,7 +493,7 @@ static int run_dump(const Options *opt)
     }
     layout_viewports(scene.views, scene.view_count, fb.fb_width, fb.fb_height);
 
-    size_t count = render_frame(&fb, &scene, 4.0f);
+    size_t count = render_frame(&fb, &scene, 4.0f, NULL);
     draw_viewport_borders(&fb, &scene);
     framebuffer_resolve(&fb, resolved);
     draw_hud(resolved, opt->width, opt->height, &scene, -1.0, count, opt->ssaa);
@@ -508,15 +532,17 @@ static int run_benchmark(const Options *opt)
      * and averaging that startup cost into the steady-state figure understates
      * the frame rate the screensaver actually sustains. */
     for (int frame = 0; frame < opt->warmup_frames; frame++)
-        render_frame(&fb, &scene, (float)frame * BENCH_DT);
+        render_frame(&fb, &scene, (float)frame * BENCH_DT, NULL);
     if (opt->warmup_frames > 0)
         printf("Warmup:     %d frames (untimed)\n", opt->warmup_frames);
 
     size_t last_total = 0;
+    FrameTimings timings = { 0.0, 0.0, 0.0 };
     double start = now_seconds();
     for (int frame = 0; frame < opt->bench_frames; frame++)
         last_total = render_frame(&fb, &scene,
-                                  (float)(opt->warmup_frames + frame) * BENCH_DT);
+                                  (float)(opt->warmup_frames + frame) * BENCH_DT,
+                                  &timings);
     double elapsed = now_seconds() - start;
 
     double per_frame_ms = elapsed * 1000.0 / opt->bench_frames;
@@ -527,6 +553,12 @@ static int run_benchmark(const Options *opt)
            world_chunk_count(&scene.worlds[0]), scene.worlds[0].generated_this_frame);
     printf("Total:      %.4f s\n", elapsed);
     printf("Per frame:  %.4f ms  (%.2f FPS)\n", per_frame_ms, 1000.0 / per_frame_ms);
+    printf("  stream:   %.4f ms  (%.1f%%)\n",
+           timings.stream * 1000.0 / opt->bench_frames, 100.0 * timings.stream / elapsed);
+    printf("  geometry: %.4f ms  (%.1f%%)\n",
+           timings.geometry * 1000.0 / opt->bench_frames, 100.0 * timings.geometry / elapsed);
+    printf("  raster:   %.4f ms  (%.1f%%)\n",
+           timings.raster * 1000.0 / opt->bench_frames, 100.0 * timings.raster / elapsed);
 
     scene_free(&scene);
     free(resolved);
@@ -592,7 +624,7 @@ static int run_interactive(const Options *opt)
 
         double current = now_seconds();
 
-        triangles = render_frame(&fb, &scene, (float)(current - start_time));
+        triangles = render_frame(&fb, &scene, (float)(current - start_time), NULL);
         draw_viewport_borders(&fb, &scene);
         framebuffer_resolve(&fb, resolved);
         draw_hud(resolved, opt->width, opt->height, &scene, fps, triangles, opt->ssaa);
