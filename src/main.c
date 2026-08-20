@@ -571,6 +571,51 @@ static int run_benchmark(const Options *opt)
 
 /* ----------------------------------------------------------- interactive */
 
+/* Reallocates everything that depends on the window size: framebuffer, resolve
+ * buffer, streaming texture and viewport layout.
+ *
+ * The new surfaces are allocated BEFORE the old ones are released, and the swap
+ * only happens once all three succeed. A resize that runs out of memory then
+ * leaves the program running at the previous size instead of tearing down
+ * buffers it cannot replace. */
+static int resize_surfaces(SDL_Renderer *renderer, SDL_Texture **screen,
+                           Framebuffer *fb, uint32_t **resolved, Scene *scene,
+                           int width, int height, int ssaa)
+{
+    Framebuffer next_fb;
+    if (!framebuffer_init(&next_fb, width, height, ssaa)) {
+        fprintf(stderr, "Warning: cannot resize to %dx%d at ssaa %d, keeping %dx%d\n",
+                width, height, ssaa, fb->width, fb->height);
+        return 0;
+    }
+
+    uint32_t *next_resolved = malloc((size_t)width * height * sizeof(uint32_t));
+    SDL_Texture *next_screen = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGB888,
+                                                 SDL_TEXTUREACCESS_STREAMING,
+                                                 width, height);
+    if (!next_resolved || !next_screen) {
+        fprintf(stderr, "Warning: cannot resize to %dx%d, keeping %dx%d\n",
+                width, height, fb->width, fb->height);
+        free(next_resolved);
+        if (next_screen) SDL_DestroyTexture(next_screen);
+        framebuffer_free(&next_fb);
+        return 0;
+    }
+
+    framebuffer_free(fb);
+    free(*resolved);
+    SDL_DestroyTexture(*screen);
+
+    *fb = next_fb;
+    *resolved = next_resolved;
+    *screen = next_screen;
+
+    /* Panes are re-tiled over the new framebuffer; each viewport recomputes its
+     * own aspect ratio, so the views are not stretched. */
+    layout_viewports(scene->views, scene->view_count, fb->fb_width, fb->fb_height);
+    return 1;
+}
+
 static int run_interactive(const Options *opt)
 {
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
@@ -580,7 +625,8 @@ static int run_interactive(const Options *opt)
 
     SDL_Window *window = SDL_CreateWindow("Voxel Screensaver (sequential)",
                                           SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                          opt->width, opt->height, 0);
+                                          opt->width, opt->height,
+                                          SDL_WINDOW_RESIZABLE);
     SDL_Renderer *renderer = window ? SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED) : NULL;
     SDL_Texture *screen = renderer ? SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGB888,
                                                        SDL_TEXTUREACCESS_STREAMING,
@@ -608,6 +654,16 @@ static int run_interactive(const Options *opt)
     }
     layout_viewports(scene.views, scene.view_count, fb.fb_width, fb.fb_height);
 
+    /* The rubric sets a 640x480 floor; enforcing it on the window stops the
+     * user dragging below what the CLI already refuses. */
+    SDL_SetWindowMinimumSize(window, 640, 480);
+
+    int win_w = opt->width;
+    int win_h = opt->height;
+    int ssaa = opt->ssaa;
+    int show_hud = 1;
+    int fullscreen = 0;
+
     double start_time = now_seconds();
     double window_start = start_time;
     int window_frames = 0;
@@ -618,11 +674,31 @@ static int run_interactive(const Options *opt)
     while (running) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
-            if (event.type == SDL_QUIT)
+            if (event.type == SDL_QUIT) {
                 running = 0;
-            else if (event.type == SDL_KEYDOWN &&
-                     (event.key.keysym.sym == SDLK_ESCAPE || event.key.keysym.sym == SDLK_q))
-                running = 0;
+            } else if (event.type == SDL_KEYDOWN) {
+                SDL_Keycode key = event.key.keysym.sym;
+                if (key == SDLK_ESCAPE || key == SDLK_q) {
+                    running = 0;
+                } else if (key == SDLK_h || key == SDLK_F1) {
+                    show_hud = !show_hud;
+                } else if (key == SDLK_F11) {
+                    fullscreen = !fullscreen;
+                    SDL_SetWindowFullscreen(window,
+                        fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+                }
+            } else if (event.type == SDL_WINDOWEVENT &&
+                       event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+                int new_w = event.window.data1;
+                int new_h = event.window.data2;
+                if (new_w > 0 && new_h > 0 && (new_w != win_w || new_h != win_h)) {
+                    if (resize_surfaces(renderer, &screen, &fb, &resolved, &scene,
+                                        new_w, new_h, ssaa)) {
+                        win_w = new_w;
+                        win_h = new_h;
+                    }
+                }
+            }
         }
 
         double current = now_seconds();
@@ -630,9 +706,10 @@ static int run_interactive(const Options *opt)
         triangles = render_frame(&fb, &scene, (float)(current - start_time), NULL);
         draw_viewport_borders(&fb, &scene);
         framebuffer_resolve(&fb, resolved);
-        draw_hud(resolved, opt->width, opt->height, &scene, fps, triangles, opt->ssaa);
+        if (show_hud)
+            draw_hud(resolved, win_w, win_h, &scene, fps, triangles, ssaa);
 
-        SDL_UpdateTexture(screen, NULL, resolved, opt->width * (int)sizeof(uint32_t));
+        SDL_UpdateTexture(screen, NULL, resolved, win_w * (int)sizeof(uint32_t));
         SDL_RenderClear(renderer);
         SDL_RenderCopy(renderer, screen, NULL, NULL);
         SDL_RenderPresent(renderer);
@@ -679,5 +756,8 @@ int main(int argc, char **argv)
         return run_dump(&opt);
     if (opt.bench_frames > 0)
         return run_benchmark(&opt);
+
+    printf("Controls: H or F1 toggles the HUD | F11 fullscreen | Esc or Q quits\n");
+    printf("          the window is resizable; panes re-tile and keep their aspect\n");
     return run_interactive(&opt);
 }
