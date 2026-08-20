@@ -160,6 +160,18 @@ static void make_leaves(Texture *t)
     }
 }
 
+static void make_water(Texture *t)
+{
+    /* Faint horizontal banding reads as a rippled surface from above. */
+    for (int y = 0; y < TEX_SIZE; y++) {
+        for (int x = 0; x < TEX_SIZE; x++) {
+            int band = ((x + (y / 3) * 2) % 8 < 4) ? 8 : -8;
+            int n = (int)(hash2(x, y, 121) % 11) - 5;
+            t->px[y * TEX_SIZE + x] = rgb(46 + band + n, 96 + band + n, 178 + band + n);
+        }
+    }
+}
+
 void textures_init(void)
 {
     fill_noise(&g_textures[TEX_STONE], 122, 122, 122, 20, 11);
@@ -175,6 +187,9 @@ void textures_init(void)
     fill_noise(&g_textures[TEX_SAND], 217, 205, 152, 14, 101);
     fill_noise(&g_textures[TEX_SNOW], 238, 244, 247, 9, 111);
     make_leaves(&g_textures[TEX_LEAVES]);
+    make_water(&g_textures[TEX_WATER]);
+    fill_noise(&g_textures[TEX_GRAVEL], 136, 132, 128, 30, 131);
+    fill_noise(&g_textures[TEX_DRY_GRASS], 150, 156, 84, 20, 141);
 }
 
 const Texture *texture_get(int id)
@@ -195,7 +210,10 @@ static const Block g_blocks[] = {
     { "Bricks",      TEX_BRICK,       TEX_BRICK,        TEX_BRICK    },
     { "Sand",        TEX_SAND,        TEX_SAND,         TEX_SAND     },
     { "Snow",        TEX_SNOW,        TEX_SNOW,         TEX_SNOW     },
-    { "Leaves",      TEX_LEAVES,      TEX_LEAVES,       TEX_LEAVES   }
+    { "Leaves",      TEX_LEAVES,      TEX_LEAVES,       TEX_LEAVES   },
+    { "Water",       TEX_WATER,       TEX_WATER,        TEX_WATER    },
+    { "Gravel",      TEX_GRAVEL,      TEX_GRAVEL,       TEX_GRAVEL   },
+    { "Dry Grass",   TEX_DRY_GRASS,   TEX_GRASS_SIDE,   TEX_DIRT     }
 };
 
 int block_count(void)

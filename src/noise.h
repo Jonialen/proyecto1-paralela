@@ -15,6 +15,12 @@ float noise_value_2d(float x, float y, uint32_t seed);
 float noise_fbm_2d(float x, float y, uint32_t seed,
                    int octaves, float lacunarity, float gain);
 
+/* Ridged noise: 1 - |2n - 1| folds the fBm around its midpoint, turning smooth
+ * hills into sharp crests. Squaring the result sharpens them further. This is
+ * what makes mountains look like mountains instead of large round blobs. */
+float noise_ridged_2d(float x, float y, uint32_t seed,
+                      int octaves, float lacunarity, float gain);
+
 /* Deterministic 3D hash in [0, 1), used for scattering ores and trees. */
 float noise_hash_3d(int x, int y, int z, uint32_t seed);
 

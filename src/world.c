@@ -16,6 +16,9 @@
 #define ID_SAND    block_id_from_index(8)
 #define ID_SNOW    block_id_from_index(9)
 #define ID_LEAVES  block_id_from_index(10)
+#define ID_WATER   block_id_from_index(11)
+#define ID_GRAVEL  block_id_from_index(12)
+#define ID_DRYGRAS block_id_from_index(13)
 
 /* Integer floor division and non-negative modulo. Plain / and % truncate
  * towards zero, which puts world x = -1 in chunk 0 instead of chunk -1 and
@@ -75,62 +78,177 @@ TerrainParams terrain_default(uint32_t seed)
 {
     TerrainParams p;
     p.seed = seed;
-    p.scale = 34.0f;
+    p.scale = 40.0f;
     p.octaves = 4;
     p.lacunarity = 2.0f;
     p.gain = 0.5f;
-    p.base_height = 5.0f;
-    p.amplitude = 17.0f;
-    p.sand_level = 8;
-    p.snow_level = 18;
-    p.tree_chance = 0.02f;
+    p.base_height = 6.0f;
+    p.amplitude = 16.0f;
+    p.mountain_amplitude = 22.0f;
+    p.warp_strength = 0.55f;
+    p.sea_level = 12;
+    p.beach_margin = 2;
+    p.snow_line = 34;
+    p.tree_chance = 0.05f;
     return p;
 }
 
 float terrain_peak(const TerrainParams *params)
 {
-    return params->base_height + params->amplitude;
+    return params->base_height + params->amplitude + params->mountain_amplitude;
+}
+
+static float clamp01(float v)
+{
+    if (v < 0.0f) return 0.0f;
+    if (v > 1.0f) return 1.0f;
+    return v;
+}
+
+static float smoothstep01(float t)
+{
+    return t * t * (3.0f - 2.0f * t);
+}
+
+TerrainSample terrain_sample(const TerrainParams *params, int world_x, int world_z)
+{
+    float nx = (float)world_x / params->scale;
+    float nz = (float)world_z / params->scale;
+
+    /* DOMAIN WARPING: displace the sample point using more noise before reading
+     * the height field. Plain fBm produces round, obviously procedural blobs;
+     * warping the input bends those contours into ridges, inlets and valleys
+     * that look eroded. It costs two extra noise lookups and changes the whole
+     * character of the terrain. */
+    float warp_x = noise_fbm_2d(nx * 0.7f + 4.3f, nz * 0.7f - 2.1f,
+                                params->seed + 7001u, 2, 2.0f, 0.5f) - 0.5f;
+    float warp_z = noise_fbm_2d(nx * 0.7f - 1.9f, nz * 0.7f + 6.7f,
+                                params->seed + 7002u, 2, 2.0f, 0.5f) - 0.5f;
+    nx += warp_x * params->warp_strength;
+    nz += warp_z * params->warp_strength;
+
+    /* Base relief: ordinary rolling terrain. Smoothstep is symmetric -- it
+     * flattens both extremes and steepens the middle where fBm clusters, which
+     * increases contrast between valleys and ridges. */
+    float base = smoothstep01(noise_fbm_2d(nx, nz, params->seed,
+                                           params->octaves, params->lacunarity,
+                                           params->gain));
+
+    /* Mountain mask: a separate low-frequency field decides WHERE mountains are
+     * allowed at all, so ranges are localized instead of spread evenly. Only
+     * the top of its range counts, remapped so the transition is gradual. */
+    float mask = noise_fbm_2d(nx * 0.32f + 17.0f, nz * 0.32f - 11.0f,
+                              params->seed + 3301u, 2, 2.0f, 0.5f);
+    mask = smoothstep01(clamp01((mask - 0.52f) * 2.6f));
+
+    /* Ridged noise gives crests rather than domes. */
+    float ridge = noise_ridged_2d(nx * 1.15f, nz * 1.15f,
+                                  params->seed + 4401u, 4, 2.0f, 0.5f);
+
+    float h = params->base_height
+            + base * params->amplitude
+            + mask * ridge * params->mountain_amplitude;
+
+    TerrainSample sample;
+    sample.height = (int)h;
+    if (sample.height < 1) sample.height = 1;
+    if (sample.height > CHUNK_SIZE_Y - 10) sample.height = CHUNK_SIZE_Y - 10;
+
+    /* Climate fields, at a much lower frequency than the relief so a biome
+     * spans many chunks instead of flickering block to block. */
+    float temperature = noise_fbm_2d(nx * 0.16f + 31.0f, nz * 0.16f + 13.0f,
+                                     params->seed + 8801u, 2, 2.0f, 0.5f);
+    float humidity = noise_fbm_2d(nx * 0.19f - 23.0f, nz * 0.19f + 29.0f,
+                                  params->seed + 8802u, 2, 2.0f, 0.5f);
+
+    /* Height wins over climate: an ocean is an ocean whatever the weather. */
+    if (sample.height <= params->sea_level)
+        sample.biome = BIOME_OCEAN;
+    else if (sample.height <= params->sea_level + params->beach_margin)
+        sample.biome = BIOME_BEACH;
+    else if (sample.height >= params->snow_line || mask > 0.55f)
+        sample.biome = BIOME_MOUNTAIN;
+    else if (temperature > 0.60f && humidity < 0.42f)
+        sample.biome = BIOME_DESERT;
+    else if (temperature < 0.34f)
+        sample.biome = BIOME_TUNDRA;
+    else if (humidity > 0.54f)
+        sample.biome = BIOME_FOREST;
+    else
+        sample.biome = BIOME_PLAINS;
+
+    return sample;
 }
 
 int terrain_height(const TerrainParams *params, int world_x, int world_z)
 {
-    float n = noise_fbm_2d((float)world_x / params->scale,
-                           (float)world_z / params->scale,
-                           params->seed, params->octaves,
-                           params->lacunarity, params->gain);
-
-    /* Smoothstep applied to the noise itself. It is symmetric: it flattens both
-     * extremes and steepens the middle, where fBm output clusters. The result
-     * is more contrast between valleys and ridges, not a downward bias. */
-    n = n * n * (3.0f - 2.0f * n);
-
-    int height = (int)(params->base_height + n * params->amplitude);
-    if (height < 1) height = 1;
-    if (height > CHUNK_SIZE_Y - 6) height = CHUNK_SIZE_Y - 6;
-    return height;
+    return terrain_sample(params, world_x, world_z).height;
 }
 
-static uint8_t terrain_block(const TerrainParams *params, int y, int height,
-                             int world_x, int world_z)
+/* Ore scattering, shared by every biome: only the surface layers differ. */
+static uint8_t stone_or_ore(const TerrainParams *params, int y,
+                            int world_x, int world_z)
 {
-    int depth = height - 1 - y; /* 0 at the surface, growing downwards */
-
-    if (depth == 0) {
-        if (height >= params->snow_level) return ID_SNOW;
-        if (height <= params->sand_level) return ID_SAND;
-        return ID_GRASS;
-    }
-    if (depth <= 3) {
-        if (height >= params->snow_level) return ID_STONE;
-        if (height <= params->sand_level) return ID_SAND;
-        return ID_DIRT;
-    }
-
     float r = noise_hash_3d(world_x, y, world_z, params->seed + 5501u);
-    if (y < 6 && r > 0.988f) return ID_GOLD;
-    if (y < 4 && r < 0.008f) return ID_DIAMOND;
-    if (r > 0.965f && r <= 0.988f) return ID_COBBLE;
+    if (y < 8 && r > 0.990f) return ID_GOLD;
+    if (y < 5 && r < 0.007f) return ID_DIAMOND;
+    if (r > 0.968f && r <= 0.990f) return ID_COBBLE;
     return ID_STONE;
+}
+
+/* Surface palette for one column, by biome. `depth` is 0 at the surface and
+ * grows downwards. */
+static uint8_t terrain_block(const TerrainParams *params, const TerrainSample *sample,
+                             int y, int world_x, int world_z)
+{
+    int depth = sample->height - 1 - y;
+
+    switch (sample->biome) {
+    case BIOME_OCEAN:
+        if (depth <= 2) return (y % 3 == 0) ? ID_GRAVEL : ID_SAND;
+        break;
+    case BIOME_BEACH:
+        if (depth <= 3) return ID_SAND;
+        break;
+    case BIOME_DESERT:
+        if (depth <= 4) return ID_SAND;
+        break;
+    case BIOME_TUNDRA:
+        if (depth == 0) return ID_SNOW;
+        if (depth <= 3) return ID_DIRT;
+        break;
+    case BIOME_MOUNTAIN:
+        if (sample->height >= params->snow_line) {
+            if (depth <= 1) return ID_SNOW;
+            if (depth <= 4) return ID_STONE;
+        } else {
+            if (depth == 0) return (y % 5 == 0) ? ID_GRAVEL : ID_STONE;
+            if (depth <= 3) return ID_STONE;
+        }
+        break;
+    case BIOME_PLAINS:
+        if (depth == 0) return ID_DRYGRAS;
+        if (depth <= 3) return ID_DIRT;
+        break;
+    case BIOME_FOREST:
+    default:
+        if (depth == 0) return ID_GRASS;
+        if (depth <= 3) return ID_DIRT;
+        break;
+    }
+
+    return stone_or_ore(params, y, world_x, world_z);
+}
+
+/* How often a column of this biome grows a tree. */
+static float biome_tree_chance(const TerrainParams *params, Biome biome)
+{
+    switch (biome) {
+    case BIOME_FOREST: return params->tree_chance * 3.0f;
+    case BIOME_PLAINS: return params->tree_chance * 0.5f;
+    case BIOME_TUNDRA: return params->tree_chance * 0.25f;
+    default:           return 0.0f; /* no trees on sand, rock, snow or water */
+    }
 }
 
 /* Small oak: a trunk with a two-layer canopy. Canopy blocks that fall outside
@@ -138,7 +256,7 @@ static uint8_t terrain_block(const TerrainParams *params, int y, int height,
  * their crown -- the usual cost of generating chunks independently. */
 static void place_tree(Chunk *chunk, int x, int height, int z)
 {
-    int trunk = 4 + (height % 2);
+    int trunk = 4 + (height % 3);
     int top = height + trunk;
     if (top + 1 >= CHUNK_SIZE_Y)
         return;
@@ -162,6 +280,20 @@ static void place_tree(Chunk *chunk, int x, int height, int z)
     chunk_set(chunk, x, top, z, ID_LEAVES);
 }
 
+/* Scans down for the highest non-air layer, so emission can skip empty sky. */
+static void chunk_update_height_limit(Chunk *chunk)
+{
+    for (int y = CHUNK_SIZE_Y - 1; y >= 0; y--) {
+        for (int i = 0; i < CHUNK_SIZE_Z * CHUNK_SIZE_X; i++) {
+            if (chunk->blocks[y * CHUNK_SIZE_Z * CHUNK_SIZE_X + i] != BLOCK_AIR) {
+                chunk->height_limit = (uint16_t)(y + 1);
+                return;
+            }
+        }
+    }
+    chunk->height_limit = 0;
+}
+
 void chunk_generate(Chunk *chunk, const TerrainParams *params,
                     int chunk_x, int chunk_z)
 {
@@ -173,17 +305,24 @@ void chunk_generate(Chunk *chunk, const TerrainParams *params,
              * generated on its own line up with neighbours generated later. */
             int world_x = chunk_x * CHUNK_SIZE_X + x;
             int world_z = chunk_z * CHUNK_SIZE_Z + z;
-            int height = terrain_height(params, world_x, world_z);
+            TerrainSample sample = terrain_sample(params, world_x, world_z);
 
-            for (int y = 0; y < height; y++)
+            for (int y = 0; y < sample.height; y++)
                 chunk_set(chunk, x, y, z,
-                          terrain_block(params, y, height, world_x, world_z));
+                          terrain_block(params, &sample, y, world_x, world_z));
 
-            if (height > params->sand_level && height < params->snow_level &&
-                noise_hash_3d(world_x, 777, world_z, params->seed + 91u) < params->tree_chance)
-                place_tree(chunk, x, height, z);
+            /* Flood everything below sea level that the ground did not fill. */
+            for (int y = sample.height; y <= params->sea_level; y++)
+                chunk_set(chunk, x, y, z, ID_WATER);
+
+            float chance = biome_tree_chance(params, sample.biome);
+            if (chance > 0.0f &&
+                noise_hash_3d(world_x, 777, world_z, params->seed + 91u) < chance)
+                place_tree(chunk, x, sample.height, z);
         }
     }
+
+    chunk_update_height_limit(chunk);
 }
 
 /* --------------------------------------------------------------- chunk map */
@@ -503,7 +642,8 @@ size_t world_emit_view(TriangleBuffer *out, const World *world, Vec3 camera_pos,
             float base_x = (float)cx * CHUNK_SIZE_X;
             float base_z = (float)cz * CHUNK_SIZE_Z;
 
-            for (int y = 0; y < CHUNK_SIZE_Y; y++) {
+            int y_limit = (int)chunk->height_limit;
+            for (int y = 0; y < y_limit; y++) {
                 for (int z = 0; z < CHUNK_SIZE_Z; z++) {
                     for (int x = 0; x < CHUNK_SIZE_X; x++) {
                         uint8_t id = chunk->blocks[chunk_index(x, y, z)];

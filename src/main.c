@@ -139,9 +139,10 @@ static int scene_init(Scene *scene, const Options *opt)
         return 0;
     }
 
-    /* Fly above the highest ground the generator can reach, not above the
-     * average, or the explorers clip through peaks. */
-    float flight_height = terrain_peak(&params) + 10.0f;
+    /* Above the ordinary terrain and above all but the rarest peaks. Clearing
+     * the absolute maximum would put the explorers so high that the ground
+     * became a distant texture. */
+    float flight_height = terrain_peak(&params) * 0.78f + 7.0f;
 
     scene->view_count = opt->players;
     for (int i = 0; i < scene->view_count; i++) {
@@ -218,6 +219,8 @@ static size_t render_frame(Framebuffer *fb, Scene *scene, float t, FrameTimings 
 
     /* Phase 2 -- rendering. The world is read-only from here on. */
     framebuffer_clear(fb, 0x0E1622);
+    for (int i = 0; i < scene->view_count; i++)
+        framebuffer_sky(fb, &scene->views[i].viewport, 0x16294A, 0x8FB6D8);
 
     /* >>> The parallel decomposition lives here: this loop over independent
      * views is the one that becomes an OpenMP parallel for. <<< */

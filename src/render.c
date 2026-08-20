@@ -88,6 +88,28 @@ void framebuffer_clear(Framebuffer *fb, uint32_t color)
     }
 }
 
+void framebuffer_sky(Framebuffer *fb, const Viewport *view,
+                     uint32_t top, uint32_t horizon)
+{
+    int tr = (int)((top >> 16) & 0xFF), tg = (int)((top >> 8) & 0xFF), tb = (int)(top & 0xFF);
+    int hr = (int)((horizon >> 16) & 0xFF), hg = (int)((horizon >> 8) & 0xFF), hb = (int)(horizon & 0xFF);
+
+    for (int y = 0; y < view->height; y++) {
+        /* Squared ramp keeps most of the pane the deeper colour and compresses
+         * the bright band down near the horizon, which is how a real sky reads. */
+        float t = (float)y / (float)(view->height > 1 ? view->height - 1 : 1);
+        t = t * t;
+        int r = tr + (int)((hr - tr) * t);
+        int g = tg + (int)((hg - tg) * t);
+        int b = tb + (int)((hb - tb) * t);
+        uint32_t color = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+
+        uint32_t *row = &fb->color[(size_t)(view->y + y) * fb->fb_width + (size_t)view->x];
+        for (int x = 0; x < view->width; x++)
+            row[x] = color;
+    }
+}
+
 void framebuffer_resolve(const Framebuffer *fb, uint32_t *out)
 {
     int s = fb->ssaa;

@@ -34,7 +34,7 @@ Mat4 camera_view_proj(const Camera *camera, float t, float aspect)
     /* Pitch is its own gentle oscillation, biased downwards so the terrain
      * stays in frame rather than the empty sky. */
     float ts = t * camera->speed;
-    float pitch = -0.20f + 0.13f * sinf(camera->bob_rate * 0.6f * ts + camera->phase_y);
+    float pitch = -0.42f + 0.14f * sinf(camera->bob_rate * 0.6f * ts + camera->phase_y);
     float cos_pitch = cosf(pitch);
 
     Vec3 target = vec3_make(eye.x + dx * cos_pitch,

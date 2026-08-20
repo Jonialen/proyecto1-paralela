@@ -10,12 +10,16 @@
  * value indexes the block table through block_from_id(). The world is infinite
  * on X and Z and bounded on Y, so a chunk is addressed by (cx, cz) alone. */
 #define CHUNK_SIZE_X 16
-#define CHUNK_SIZE_Y 32
+#define CHUNK_SIZE_Y 64
 #define CHUNK_SIZE_Z 16
 #define CHUNK_VOLUME (CHUNK_SIZE_X * CHUNK_SIZE_Y * CHUNK_SIZE_Z)
 
 typedef struct {
     uint8_t blocks[CHUNK_VOLUME];
+    /* One past the highest non-air block. The emission loop stops here instead
+     * of walking all CHUNK_SIZE_Y layers, which matters because most of a tall
+     * chunk is empty sky. */
+    uint16_t height_limit;
 } Chunk;
 
 void chunk_clear(Chunk *chunk);
@@ -29,16 +33,41 @@ void chunk_set(Chunk *chunk, int x, int y, int z, uint8_t id);
  * order, and still line up seamlessly. */
 typedef struct {
     uint32_t seed;
-    float scale;       /* world units per noise unit; larger = broader hills */
+    float scale;         /* world units per noise unit; larger = broader hills */
     int octaves;
     float lacunarity;
     float gain;
     float base_height;
-    float amplitude;
-    int sand_level;
-    int snow_level;
-    float tree_chance;
+    float amplitude;          /* vertical range of ordinary rolling terrain */
+    float mountain_amplitude; /* extra height where the mountain mask is high */
+    float warp_strength;      /* how far the domain warp displaces the sample */
+    int sea_level;
+    int beach_margin;    /* blocks above sea level that still count as shore */
+    int snow_line;       /* height at or above which surfaces are snow */
+    float tree_chance;   /* base probability; biomes scale it */
 } TerrainParams;
+
+/* Biomes come from two low-frequency fields, temperature and humidity, crossed
+ * with the terrain height. Each one selects a different surface palette and a
+ * different tree density. */
+typedef enum {
+    BIOME_OCEAN,
+    BIOME_BEACH,
+    BIOME_DESERT,
+    BIOME_PLAINS,
+    BIOME_FOREST,
+    BIOME_TUNDRA,
+    BIOME_MOUNTAIN
+} Biome;
+
+/* Height and biome for one column, sampled together so the noise fields are
+ * evaluated once rather than once per query. */
+typedef struct {
+    int height;
+    Biome biome;
+} TerrainSample;
+
+TerrainSample terrain_sample(const TerrainParams *params, int world_x, int world_z);
 
 TerrainParams terrain_default(uint32_t seed);
 int terrain_height(const TerrainParams *params, int world_x, int world_z);

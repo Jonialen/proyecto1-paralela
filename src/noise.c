@@ -60,6 +60,14 @@ float noise_fbm_2d(float x, float y, uint32_t seed,
     return sum / total;
 }
 
+float noise_ridged_2d(float x, float y, uint32_t seed,
+                      int octaves, float lacunarity, float gain)
+{
+    float n = noise_fbm_2d(x, y, seed, octaves, lacunarity, gain);
+    float ridge = 1.0f - fabsf(2.0f * n - 1.0f);
+    return ridge * ridge;
+}
+
 float noise_hash_3d(int x, int y, int z, uint32_t seed)
 {
     return hash_unit(hash_ints((uint32_t)x, (uint32_t)y, (uint32_t)z, seed));

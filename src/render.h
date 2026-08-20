@@ -41,6 +41,13 @@ static inline float viewport_aspect(const Viewport *view)
     return (float)view->width / (float)view->height;
 }
 
+/* Paints a vertical gradient over one viewport, colour only. Depth is left
+ * alone, so this runs after framebuffer_clear() and before the geometry. Each
+ * viewport gets its own gradient because the panes are stacked: a single
+ * framebuffer-wide gradient would put the horizon in the wrong place. */
+void framebuffer_sky(Framebuffer *fb, const Viewport *view,
+                     uint32_t top, uint32_t horizon);
+
 /* ------------------------------------------------------ geometry output */
 
 /* A vertex after projection and the perspective divide. u_w/v_w/inv_w carry the

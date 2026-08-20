@@ -26,6 +26,9 @@ enum {
     TEX_SAND,
     TEX_SNOW,
     TEX_LEAVES,
+    TEX_WATER,
+    TEX_GRAVEL,
+    TEX_DRY_GRASS,
     TEX_COUNT
 };
 
