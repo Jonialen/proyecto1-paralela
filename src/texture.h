@@ -11,7 +11,7 @@
  * `mask` is `size - 1`. Every real pack uses a power-of-two edge, which keeps
  * texture wrapping a single AND instead of a modulo in the innermost loop of
  * the rasterizer. */
-#define TEX_PROCEDURAL_SIZE 16
+#define TEX_PROCEDURAL_SIZE 32
 #define TEX_MAX_SIZE 512
 
 typedef struct {

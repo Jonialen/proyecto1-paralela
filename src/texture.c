@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 /* The procedural generators all draw on a 16x16 grid. A loaded pack may be
  * larger, but nothing in here needs to know that. */
@@ -35,30 +36,122 @@ static uint32_t rgb(int r, int g, int b)
             (uint32_t)clamp_channel(b);
 }
 
-/* Base colour plus symmetric per-pixel noise: the bread and butter of every
- * Minecraft-ish stone/dirt tile. */
-static void fill_noise(Texture *t, int r, int g, int b, int amplitude, uint32_t seed)
+static void put(Texture *t, int x, int y, int r, int g, int b)
+{
+    t->px[y * TEX_SIZE + x] = rgb(r, g, b);
+}
+
+static float smooth_t(float t)
+{
+    return t * t * (3.0f - 2.0f * t);
+}
+
+/* Value noise over a lattice of `period` cells across the tile.
+ *
+ * The lattice indices wrap modulo `period`, which is what makes the result
+ * SEAMLESS: the left edge of the tile interpolates towards the same lattice
+ * values as the right edge, so blocks placed side by side show no seam. Plain
+ * unwrapped noise would draw a visible grid across the terrain. */
+static float tile_noise(int x, int y, int period, uint32_t seed)
+{
+    float fx = (float)x * (float)period / (float)TEX_SIZE;
+    float fy = (float)y * (float)period / (float)TEX_SIZE;
+    int x0 = (int)fx, y0 = (int)fy;
+    float tx = smooth_t(fx - (float)x0);
+    float ty = smooth_t(fy - (float)y0);
+
+    int xa = x0 % period, xb = (x0 + 1) % period;
+    int ya = y0 % period, yb = (y0 + 1) % period;
+
+    float v00 = (float)(hash2(xa, ya, seed) & 0xFFFF) / 65535.0f;
+    float v10 = (float)(hash2(xb, ya, seed) & 0xFFFF) / 65535.0f;
+    float v01 = (float)(hash2(xa, yb, seed) & 0xFFFF) / 65535.0f;
+    float v11 = (float)(hash2(xb, yb, seed) & 0xFFFF) / 65535.0f;
+
+    float top = v00 + (v10 - v00) * tx;
+    float bottom = v01 + (v11 - v01) * tx;
+    return top + (bottom - top) * ty;
+}
+
+/* Grain plus broad blotches. Fine noise alone reads as television static; the
+ * low-frequency layer is what makes a surface look like a material. */
+static void fill_material(Texture *t, int r, int g, int b,
+                          int grain, int blotch, int period, uint32_t seed)
 {
     for (int y = 0; y < TEX_SIZE; y++) {
         for (int x = 0; x < TEX_SIZE; x++) {
-            int n = (int)(hash2(x, y, seed) % (uint32_t)(2 * amplitude + 1)) - amplitude;
-            t->px[y * TEX_SIZE + x] = rgb(r + n, g + n, b + n);
+            int fine = (int)(hash2(x, y, seed) % (uint32_t)(2 * grain + 1)) - grain;
+            int broad = (int)((tile_noise(x, y, period, seed + 77u) - 0.5f) * 2.0f * (float)blotch);
+            int d = fine + broad;
+            put(t, x, y, r + d, g + d, b + d);
+        }
+    }
+}
+
+static void make_stone(Texture *t)
+{
+    fill_material(t, 126, 126, 128, 9, 16, 4, 11);
+    /* A few darker cracks, drawn as short noise-guided streaks. */
+    for (int y = 0; y < TEX_SIZE; y++) {
+        for (int x = 0; x < TEX_SIZE; x++) {
+            float n = tile_noise(x, y, 6, 12u);
+            if (n > 0.80f) {
+                int d = (int)((n - 0.80f) * 300.0f);
+                put(t, x, y, 126 - d, 126 - d, 128 - d);
+            }
         }
     }
 }
 
 static void make_cobble(Texture *t)
 {
-    fill_noise(t, 122, 122, 122, 22, 11);
-    /* Dark mortar lines carve the tile into irregular stones. */
+    /* Irregular stones. The noise field is quantized into bands, and a pixel is
+     * mortar when its band differs from a neighbour's. Comparing the gradient
+     * instead marks far too much of the tile as edge, which buries the stones
+     * under mortar and leaves the block almost black. */
     for (int y = 0; y < TEX_SIZE; y++) {
         for (int x = 0; x < TEX_SIZE; x++) {
-            int cell_y = y / 5;
-            int offset = (cell_y & 1) ? 3 : 0;
-            int edge = ((x + offset) % 7 == 0) || (y % 5 == 0);
-            if (edge) {
-                int n = (int)(hash2(x, y, 12) % 12);
-                t->px[y * TEX_SIZE + x] = rgb(66 + n, 66 + n, 66 + n);
+            int here  = (int)(tile_noise(x, y, 5, 21u) * 9.0f);
+            int right = (int)(tile_noise((x + 1) % TEX_SIZE, y, 5, 21u) * 9.0f);
+            int below = (int)(tile_noise(x, (y + 1) % TEX_SIZE, 5, 21u) * 9.0f);
+
+            int grain = (int)(hash2(x, y, 22) % 17) - 8;
+            if (here != right || here != below) {
+                put(t, x, y, 74 + grain, 74 + grain, 76 + grain);   /* mortar */
+            } else {
+                /* Each stone gets its own tone from its band index. */
+                int shade = (int)(hash2(here, here * 3 + 1, 23) % 40) - 20;
+                put(t, x, y, 140 + shade + grain, 140 + shade + grain, 142 + shade + grain);
+            }
+        }
+    }
+}
+
+static void make_dirt(Texture *t)
+{
+    fill_material(t, 128, 90, 62, 10, 18, 4, 31);
+    /* Pebbles and root flecks. */
+    for (int y = 0; y < TEX_SIZE; y++) {
+        for (int x = 0; x < TEX_SIZE; x++) {
+            uint32_t h = hash2(x, y, 32);
+            if (h % 29 == 0)
+                put(t, x, y, 152, 116, 84);
+            else if (h % 37 == 0)
+                put(t, x, y, 92, 62, 40);
+        }
+    }
+}
+
+static void make_grass_top(Texture *t)
+{
+    fill_material(t, 92, 148, 60, 11, 22, 5, 41);
+    /* Vertical blade hints: brighten a pixel whose neighbour above is darker. */
+    for (int y = 1; y < TEX_SIZE; y++) {
+        for (int x = 0; x < TEX_SIZE; x++) {
+            if (hash2(x, y, 42) % 6 == 0) {
+                uint32_t c = t->px[y * TEX_SIZE + x];
+                int r = (int)((c >> 16) & 0xFF), g = (int)((c >> 8) & 0xFF), b = (int)(c & 0xFF);
+                put(t, x, y, r + 16, g + 22, b + 10);
             }
         }
     }
@@ -66,77 +159,92 @@ static void make_cobble(Texture *t)
 
 static void make_grass_side(Texture *t)
 {
-    fill_noise(t, 134, 96, 67, 18, 21); /* dirt base */
+    make_dirt(t);
     for (int x = 0; x < TEX_SIZE; x++) {
-        /* Ragged grass fringe so the green does not end on a straight line. */
-        int depth = 3 + (int)(hash2(x, 0, 31) % 3);
+        /* Ragged fringe with an overhang, so the grass does not end on a line. */
+        int depth = 5 + (int)(tile_noise(x, 0, 6, 51u) * 6.0f);
         for (int y = 0; y < depth; y++) {
-            int n = (int)(hash2(x, y, 32) % 25) - 12;
-            t->px[y * TEX_SIZE + x] = rgb(93 + n, 156 + n, 59 + n);
+            int d = (int)((tile_noise(x, y, 5, 52u) - 0.5f) * 40.0f);
+            int fade = (y > depth - 3) ? -18 : 0; /* darker at the boundary */
+            put(t, x, y, 92 + d + fade, 148 + d + fade, 60 + d + fade);
         }
     }
 }
 
 static void make_gold(Texture *t)
 {
+    /* 8x8 nuggets with a lit top-left bevel and a shadowed bottom-right. */
     for (int y = 0; y < TEX_SIZE; y++) {
         for (int x = 0; x < TEX_SIZE; x++) {
-            /* 4x4 nugget grid: bright top-left bevel, dark bottom-right. */
-            int cx = x & 3, cy = y & 3;
+            int cx = x & 7, cy = y & 7;
             int shade = 0;
-            if (cx == 0 || cy == 0) shade = 26;
-            if (cx == 3 || cy == 3) shade = -34;
-            int n = (int)(hash2(x, y, 41) % 13) - 6;
-            t->px[y * TEX_SIZE + x] = rgb(246 + shade + n, 206 + shade + n, 68 + shade + n);
+            if (cx <= 1 || cy <= 1) shade = 30;
+            if (cx >= 6 || cy >= 6) shade = -40;
+            if (cx == 0 && cy == 0) shade = 52;   /* specular corner */
+            int n = (int)(hash2(x, y, 61) % 11) - 5;
+            put(t, x, y, 244 + shade + n, 202 + shade + n, 66 + shade + n);
         }
     }
 }
 
 static void make_diamond_ore(Texture *t)
 {
-    fill_noise(t, 122, 122, 122, 20, 11); /* same stone base as TEX_STONE */
-    /* Hand-placed diamond clusters, drawn as a tiny bitmap. */
+    make_stone(t);
+    /* Crystals as small diamonds with a bright core and a dark rim. */
     static const int spots[][2] = {
-        { 3, 4 }, { 4, 4 }, { 3, 5 }, { 4, 5 },
-        { 9, 3 }, { 10, 3 }, { 9, 4 },
-        { 6, 10 }, { 7, 10 }, { 6, 11 }, { 7, 11 }, { 8, 11 },
-        { 12, 9 }, { 12, 10 }, { 13, 10 }
+        { 6, 8 }, { 20, 6 }, { 13, 20 }, { 25, 23 }, { 8, 26 }
     };
-    int count = (int)(sizeof(spots) / sizeof(spots[0]));
-    for (int i = 0; i < count; i++) {
-        int x = spots[i][0], y = spots[i][1];
-        int n = (int)(hash2(x, y, 51) % 30) - 15;
-        t->px[y * TEX_SIZE + x] = rgb(94 + n, 219 + n, 219 + n);
+    for (int i = 0; i < 5; i++) {
+        int ox = spots[i][0], oy = spots[i][1];
+        for (int dy = -2; dy <= 2; dy++) {
+            for (int dx = -2; dx <= 2; dx++) {
+                int manhattan = (dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy);
+                if (manhattan > 2)
+                    continue;
+                int x = (ox + dx + TEX_SIZE) % TEX_SIZE;
+                int y = (oy + dy + TEX_SIZE) % TEX_SIZE;
+                if (manhattan == 2)
+                    put(t, x, y, 46, 122, 130);
+                else if (manhattan == 1)
+                    put(t, x, y, 94, 214, 214);
+                else
+                    put(t, x, y, 172, 246, 244);
+            }
+        }
     }
 }
 
 static void make_log_side(Texture *t)
 {
-    fill_noise(t, 106, 84, 50, 12, 61);
-    /* Vertical bark grooves. */
+    fill_material(t, 104, 80, 48, 7, 12, 3, 71);
+    /* Bark grooves: continuous vertical channels of varying width. */
     for (int x = 0; x < TEX_SIZE; x++) {
-        if (hash2(x, 7, 62) % 3 != 0)
-            continue;
-        for (int y = 0; y < TEX_SIZE; y++) {
-            int n = (int)(hash2(x, y, 63) % 10);
-            t->px[y * TEX_SIZE + x] = rgb(78 + n, 60 + n, 34 + n);
+        float n = tile_noise(x, 4, 8, 72u);
+        if (n < 0.42f) {
+            int depth = (int)((0.42f - n) * 120.0f);
+            for (int y = 0; y < TEX_SIZE; y++) {
+                int wobble = (int)(hash2(x, y, 73) % 7);
+                put(t, x, y, 104 - depth + wobble, 80 - depth + wobble, 48 - depth + wobble);
+            }
         }
     }
 }
 
 static void make_log_top(Texture *t)
 {
-    fill_noise(t, 176, 143, 86, 10, 71);
-    /* Concentric growth rings measured with a cheap Chebyshev distance. */
+    fill_material(t, 174, 140, 86, 6, 10, 3, 81);
+    /* Concentric growth rings, measured with a real radius so they are round. */
     for (int y = 0; y < TEX_SIZE; y++) {
         for (int x = 0; x < TEX_SIZE; x++) {
-            int dx = x - 8, dy = y - 8;
-            int adx = dx < 0 ? -dx : dx;
-            int ady = dy < 0 ? -dy : dy;
-            int ring = (adx > ady ? adx : ady);
-            if (ring % 3 == 0) {
-                int n = (int)(hash2(x, y, 72) % 10);
-                t->px[y * TEX_SIZE + x] = rgb(133 + n, 104 + n, 58 + n);
+            float dx = (float)x - (TEX_SIZE / 2) + 0.5f;
+            float dy = (float)y - (TEX_SIZE / 2) + 0.5f;
+            float r = sqrtf(dx * dx + dy * dy);
+            /* Wobble the radius so the rings are not perfect circles. */
+            r += (tile_noise(x, y, 4, 82u) - 0.5f) * 2.4f;
+            float ring = sinf(r * 1.9f);
+            if (ring > 0.55f) {
+                int d = (int)((ring - 0.55f) * 90.0f);
+                put(t, x, y, 174 - d, 140 - d, 86 - d);
             }
         }
     }
@@ -144,27 +252,68 @@ static void make_log_top(Texture *t)
 
 static void make_brick(Texture *t)
 {
-    fill_noise(t, 150, 84, 66, 12, 81);
+    const int course = 8, brick_w = 16;
     for (int y = 0; y < TEX_SIZE; y++) {
         for (int x = 0; x < TEX_SIZE; x++) {
-            int row = y / 4;
-            int offset = (row & 1) ? 4 : 0;
-            int mortar = (y % 4 == 0) || ((x + offset) % 8 == 0);
-            if (mortar)
-                t->px[y * TEX_SIZE + x] = rgb(174, 170, 166);
+            int row = y / course;
+            int offset = (row & 1) ? brick_w / 2 : 0;
+            int lx = (x + offset) % brick_w;
+            int ly = y % course;
+
+            if (ly < 2 || lx < 2) {
+                int n = (int)(hash2(x, y, 91) % 9);
+                put(t, x, y, 168 + n, 164 + n, 158 + n);   /* mortar */
+            } else {
+                /* Each brick gets its own tint, so the wall is not uniform. */
+                int id = (x + offset) / brick_w + row * 7;
+                int tint = (int)(hash2(id, row, 92) % 22) - 11;
+                int n = (int)(hash2(x, y, 93) % 11) - 5;
+                put(t, x, y, 150 + tint + n, 78 + tint + n, 60 + tint + n);
+            }
         }
     }
 }
 
-static void make_leaves(Texture *t)
+static void make_sand(Texture *t)
 {
-    fill_noise(t, 62, 124, 40, 26, 91);
-    /* Scattered dark gaps read as depth between individual leaves. */
+    fill_material(t, 219, 205, 152, 7, 10, 5, 101);
+    /* Fine wind ripples. */
     for (int y = 0; y < TEX_SIZE; y++) {
         for (int x = 0; x < TEX_SIZE; x++) {
-            if (hash2(x, y, 92) % 5 == 0) {
-                int n = (int)(hash2(x, y, 93) % 14);
-                t->px[y * TEX_SIZE + x] = rgb(38 + n, 78 + n, 26 + n);
+            float ripple = sinf((float)(x + y) * 0.9f + tile_noise(x, y, 4, 102u) * 5.0f);
+            if (ripple > 0.7f) {
+                uint32_t c = t->px[y * TEX_SIZE + x];
+                int r = (int)((c >> 16) & 0xFF), g = (int)((c >> 8) & 0xFF), b = (int)(c & 0xFF);
+                put(t, x, y, r + 9, g + 9, b + 7);
+            }
+        }
+    }
+}
+
+static void make_snow(Texture *t)
+{
+    fill_material(t, 240, 245, 249, 4, 7, 5, 111);
+    /* Occasional sparkle, the one thing that stops snow reading as flat white. */
+    for (int y = 0; y < TEX_SIZE; y++)
+        for (int x = 0; x < TEX_SIZE; x++)
+            if (hash2(x, y, 112) % 61 == 0)
+                put(t, x, y, 255, 255, 255);
+}
+
+static void make_leaves(Texture *t)
+{
+    fill_material(t, 66, 128, 42, 14, 26, 6, 121);
+    for (int y = 0; y < TEX_SIZE; y++) {
+        for (int x = 0; x < TEX_SIZE; x++) {
+            float n = tile_noise(x, y, 7, 122u);
+            if (n < 0.30f) {
+                /* Gaps between leaves: dark, but not black, since the renderer
+                 * is opaque and a true hole would read as a bug. */
+                int d = (int)((0.30f - n) * 130.0f);
+                put(t, x, y, 34 - d / 3, 62 - d / 3, 24 - d / 4);
+            } else if (n > 0.74f) {
+                int d = (int)((n - 0.74f) * 110.0f);
+                put(t, x, y, 92 + d, 158 + d, 60 + d);   /* lit leaf */
             }
         }
     }
@@ -172,19 +321,54 @@ static void make_leaves(Texture *t)
 
 static void make_water(Texture *t)
 {
-    /* Faint horizontal banding reads as a rippled surface from above. */
     for (int y = 0; y < TEX_SIZE; y++) {
         for (int x = 0; x < TEX_SIZE; x++) {
-            int band = ((x + (y / 3) * 2) % 8 < 4) ? 8 : -8;
-            int n = (int)(hash2(x, y, 121) % 11) - 5;
-            t->px[y * TEX_SIZE + x] = rgb(46 + band + n, 96 + band + n, 178 + band + n);
+            /* Two crossing wave trains, the classic cheap water look. */
+            float w = sinf((float)x * 0.55f + (float)y * 0.22f)
+                    + 0.6f * sinf((float)y * 0.75f - (float)x * 0.18f);
+            int d = (int)(w * 11.0f);
+            int n = (int)(hash2(x, y, 131) % 7) - 3;
+            put(t, x, y, 44 + d + n, 100 + d + n, 182 + d + n);
         }
     }
 }
 
-/* Points every texture at its slice of one contiguous allocation. Keeping them
- * in a single block means one malloc, one free, and neighbouring textures share
- * cache lines during rasterization. */
+static void make_gravel(Texture *t)
+{
+    /* Pebbles of mixed size. The coarse field picks the pebble and gives it a
+     * tone; a much finer field breaks up its interior. Both frequencies have to
+     * be high or the result reads as poured concrete rather than loose stone. */
+    for (int y = 0; y < TEX_SIZE; y++) {
+        for (int x = 0; x < TEX_SIZE; x++) {
+            int pebble = (int)(tile_noise(x, y, 9, 141u) * 14.0f);
+            float fine = tile_noise(x, y, 16, 142u);
+
+            int tone = (int)(hash2(pebble, pebble * 5 + 3, 143) % 70) - 35;
+            int d = (int)((fine - 0.5f) * 34.0f);
+            int n = (int)(hash2(x, y, 144) % 19) - 9;
+
+            int base = 124 + tone + d + n;
+            put(t, x, y, base, base - 3, base - 8);
+        }
+    }
+}
+
+static void make_dry_grass(Texture *t)
+{
+    fill_material(t, 158, 162, 88, 10, 20, 5, 151);
+    for (int y = 0; y < TEX_SIZE; y++) {
+        for (int x = 0; x < TEX_SIZE; x++) {
+            if (hash2(x, y, 152) % 8 == 0) {
+                uint32_t c = t->px[y * TEX_SIZE + x];
+                int r = (int)((c >> 16) & 0xFF), g = (int)((c >> 8) & 0xFF), b = (int)(c & 0xFF);
+                put(t, x, y, r + 14, g + 12, b - 4);
+            }
+        }
+    }
+}
+
+/* Points every texture at its slice of one contiguous allocation. One malloc,
+ * one free, and neighbouring textures share cache lines during rasterization. */
 static int textures_alloc(int size)
 {
     size_t pixels = (size_t)TEX_COUNT * (size_t)size * (size_t)size;
@@ -225,22 +409,22 @@ void textures_init(void)
         exit(1);
     }
 
-    fill_noise(&g_textures[TEX_STONE], 122, 122, 122, 20, 11);
+    make_stone(&g_textures[TEX_STONE]);
     make_cobble(&g_textures[TEX_COBBLE]);
-    fill_noise(&g_textures[TEX_DIRT], 134, 96, 67, 18, 21);
-    fill_noise(&g_textures[TEX_GRASS_TOP], 93, 156, 59, 22, 33);
+    make_dirt(&g_textures[TEX_DIRT]);
+    make_grass_top(&g_textures[TEX_GRASS_TOP]);
     make_grass_side(&g_textures[TEX_GRASS_SIDE]);
     make_gold(&g_textures[TEX_GOLD]);
     make_diamond_ore(&g_textures[TEX_DIAMOND_ORE]);
     make_log_side(&g_textures[TEX_LOG_SIDE]);
     make_log_top(&g_textures[TEX_LOG_TOP]);
     make_brick(&g_textures[TEX_BRICK]);
-    fill_noise(&g_textures[TEX_SAND], 217, 205, 152, 14, 101);
-    fill_noise(&g_textures[TEX_SNOW], 238, 244, 247, 9, 111);
+    make_sand(&g_textures[TEX_SAND]);
+    make_snow(&g_textures[TEX_SNOW]);
     make_leaves(&g_textures[TEX_LEAVES]);
     make_water(&g_textures[TEX_WATER]);
-    fill_noise(&g_textures[TEX_GRAVEL], 136, 132, 128, 30, 131);
-    fill_noise(&g_textures[TEX_DRY_GRASS], 150, 156, 84, 20, 141);
+    make_gravel(&g_textures[TEX_GRAVEL]);
+    make_dry_grass(&g_textures[TEX_DRY_GRASS]);
 }
 
 /* Atlas file written by scripts/make_texture_atlas.py:

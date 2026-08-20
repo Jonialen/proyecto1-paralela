@@ -151,12 +151,30 @@ static int scene_init(Scene *scene, const Options *opt)
     /* Above the ordinary terrain and above all but the rarest peaks. Clearing
      * the absolute maximum would put the explorers so high that the ground
      * became a distant texture. */
+    float roam = opt->roam;
+    float view_distance = opt->view_distance;
     float flight_height = terrain_peak(&params) * 0.78f + 7.0f;
+
+    if (opt->scene == SCENE_BLOCK) {
+        /* The block scene inspects one 1x1x1 cube at the origin. The terrain
+         * flight parameters would orbit it from hundreds of units away, where
+         * it covers no pixels at all, so the camera is brought in close. */
+        roam = 2.6f;
+        view_distance = 40.0f;
+        flight_height = 1.1f;
+    }
 
     scene->view_count = opt->players;
     for (int i = 0; i < scene->view_count; i++) {
-        scene->views[i].camera = camera_make(i, scene->view_count, opt->roam,
-                                             opt->view_distance, flight_height);
+        scene->views[i].camera = camera_make(i, scene->view_count, roam,
+                                             view_distance, flight_height);
+        if (opt->scene == SCENE_BLOCK) {
+            /* Orbit the block and keep it in frame. */
+            scene->views[i].camera.center = vec3_make(0.0f, 0.0f, 0.0f);
+            scene->views[i].camera.height = 1.1f;
+            scene->views[i].camera.bob_amplitude = 0.35f;
+            scene->views[i].camera.look_at_center = 1;
+        }
         scene->views[i].world = &scene->worlds[0];
         tribuf_init(&scene->views[i].triangles);
     }

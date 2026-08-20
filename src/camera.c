@@ -22,6 +22,14 @@ void camera_basis(const Camera *camera, float t,
      * vertical bob would be wrong: near the extremes of the sine the vertical
      * velocity dominates the horizontal one and the explorer ends up staring
      * straight at the sky or the ground instead of ahead. */
+    if (camera->look_at_center) {
+        *forward = vec3_normalize(vec3_sub(camera->center, *eye));
+        Vec3 world_up = vec3_make(0.0f, 1.0f, 0.0f);
+        *right = vec3_normalize(vec3_cross(*forward, world_up));
+        *up = vec3_cross(*right, *forward);
+        return;
+    }
+
     Vec3 ahead = camera_position(camera, t + 0.08f);
     float dx = ahead.x - eye->x;
     float dz = ahead.z - eye->z;
@@ -100,6 +108,7 @@ Camera camera_make(int index, int count, float roam_radius,
     camera.fov_y_rad = 65.0f * CAMERA_PI / 180.0f;
     camera.view_distance = view_distance * (1.0f + 0.25f * (float)(index % 3));
     camera.generate_radius = camera.view_distance * CAMERA_STREAM_FACTOR;
+    camera.look_at_center = 0;
 
     return camera;
 }

@@ -33,6 +33,11 @@ typedef struct {
     float fov_y_rad;
     float view_distance;    /* how far this explorer can see: its render load */
     float generate_radius;  /* how far ahead terrain is generated */
+
+    /* When set, the camera looks at `center` instead of along its own path.
+     * A flyby looks TANGENTIALLY, which is right for exploring terrain but
+     * never puts a single block at the origin in frame. */
+    int look_at_center;
 } Camera;
 
 /* Terrain is generated out to this multiple of an explorer's view distance.

@@ -155,9 +155,12 @@ two-layer canopy. All knobs live in `TerrainParams`.
 
 ## Texture packs
 
-Textures are procedural by default, so the program runs with no assets at all.
-A Minecraft-style pack can be used instead:
+Textures are procedural by default -- 32x32, generated at startup -- so the
+program runs with no assets at all. The generators use seamless tile noise: the
+lattice indices wrap, so neighbouring blocks show no seam. Unwrapped noise draws
+a visible grid across the terrain.
 
+A pack can be used instead:
 ```sh
 scripts/make_texture_atlas.py /path/to/pack build/pack.vxtx --size 32
 ./cubeview -n 4 --textures build/pack.vxtx
