@@ -55,6 +55,7 @@ instead of tearing down buffers it cannot replace.
     --bench N       render N frames headless and report timings
     --warmup N      untimed frames before the benchmark        (default 3)
     --dump PATH     render one frame headless into a binary PPM
+    --survey N      sample the generator over an NxN area and report
     --help          show this message
 ```
 
@@ -149,9 +150,28 @@ noise (`src/noise.c`), lattice hash plus a Hermite smoothstep. **The noise is
 evaluated in world coordinates**, which is what lets chunks be generated
 independently, in any order, and still line up seamlessly.
 
-Layering: snow above `snow_level`, sand at or below `sand_level`, otherwise grass
-over dirt over stone; ores scattered with a 3D hash; trees are a log trunk with a
-two-layer canopy. All knobs live in `TerrainParams`.
+On top of the base field, **domain warping** displaces the sample point with a
+second noise field, which bends contours into ridges and inlets that read as
+eroded rather than as round fBm blobs. **Ridged noise** (`1 - |2n-1|`, squared)
+supplies crests instead of domes, gated by a separate low-frequency mask so
+ranges are localized.
+
+Seven biomes come from two low-frequency climate fields, temperature and
+humidity, crossed with the height. **Temperature falls with altitude**: sampled
+independently of the relief, the climate put snow at sea level next to a desert.
+
+All knobs live in `TerrainParams`.
+
+### Tuning terrain with `--survey`
+
+```sh
+./cubeview --survey 2048
+```
+
+Samples the generator over an NxN block area and prints a height histogram and a
+biome census. "The terrain looks flat" is not actionable; a histogram showing
+78% of the world inside an 11-block band is. Every terrain parameter in this
+project was set from that output rather than from impressions.
 
 ## Texture packs
 
@@ -199,6 +219,19 @@ the procedural set stays in place and the program keeps running.
 > `.gitignore` — the repository is made public for grading, and third-party art
 > must not be redistributed. Note in your report which pack you used and where
 > to get it.
+
+## Lighting
+
+Faces are shaded with a flat Lambert term plus **per-vertex ambient occlusion**.
+Each corner of a face is darkened by its two edge neighbours and the diagonal,
+read from a 27-bit map of the block's 3x3x3 neighbourhood.
+
+Without it, every face of a given orientation renders at exactly the same
+brightness whatever surrounds it, and voxel terrain looks like flat plastic. It
+is the single largest visual difference, and it costs about 20% of the frame.
+
+Light is therefore a per-vertex attribute, interpolated perspective-correct by
+the rasterizer like the texture coordinates.
 
 ## Sky and the day/night cycle
 
@@ -278,67 +311,64 @@ camera's geometry can never bleed into a neighbouring pane.
 960x720, gcc `-O2`, 4 untimed warmup frames per point. Reproduce with
 `scripts/sweep.sh`.
 
+**Run benchmarks on an idle machine.** Frame times here are sensitive to system
+load: a busy desktop shifts every stage by the same factor, which looks exactly
+like a regression in whatever you changed last.
+
 ### Explorers (`--view 96 --ssaa 1`)
 
-| N | triangles | chunks | ms/frame | FPS |
-|---|---|---|---|---|
-| 1  |  25948 |  720 |  19.03 | 52.6 |
-| 2  |  36148 | 1843 |  27.89 | 35.9 |
-| 4  | 140870 | 2898 |  55.00 | 18.2 |
-| 8  | 288753 | 4841 | 100.47 |  9.9 |
-| 16 | 604685 | 5533 | 191.83 |  5.2 |
-
-**The sequential build falls below 30 FPS from N = 4 onwards.** Recovering that
-floor is what the parallel version is for.
+| N | triangles | chunks | ms/frame | FPS | geometry | raster | sky |
+|---|---|---|---|---|---|---|---|
+| 1  |  16700 |  713 |  49.1 | 20.4 |  13.5 | 14.7 | 20.1 |
+| 2  |  28604 | 1833 |  79.2 | 12.6 |  43.8 | 16.0 | 18.4 |
+| 4  | 138501 | 2887 | 157.4 |  6.4 | 109.6 | 28.8 | 17.9 |
+| 8  | 328678 | 4806 | 299.1 |  3.3 | 240.8 | 40.6 | 16.2 |
+| 16 | 699218 | 5505 | 570.2 |  1.8 | 489.3 | 60.2 | 18.6 |
 
 ### Render distance (`-n 4 --ssaa 1`)
 
 | view | triangles | chunks | ms/frame | FPS |
 |---|---|---|---|---|
-| 48  |  33002 |  866 |  19.24 | 52.0 |
-| 96  | 140870 | 2898 |  54.37 | 18.4 |
-| 160 | 389265 | 7282 | 128.33 |  7.8 |
+| 48  |  36934 |  859 |  65.7 | 15.2 |
+| 96  | 138501 | 2887 | 157.2 |  6.4 |
+| 160 | 372092 | 7268 | 360.4 |  2.8 |
 
 Triangles grow with the disk area, so doubling the render distance roughly
 quadruples the geometry.
 
 ### Supersampling (`-n 4 --view 96`)
 
-| ssaa | triangles | ms/frame | FPS |
-|---|---|---|---|
-| 1 | 140933 |  53.53 | 18.7 |
-| 2 | 140844 |  84.85 | 11.8 |
-| 4 | 140795 | 190.72 |  5.2 |
+| ssaa | ms/frame | FPS | geometry | raster | sky |
+|---|---|---|---|---|---|
+| 1 | 157.5 | 6.4 | 109.5 |  28.9 |  18.0 |
+| 2 | 266.3 | 3.8 | 109.8 |  81.8 |  71.4 |
+| 4 | 672.6 | 1.5 | 109.5 | 266.7 | 284.9 |
 
-Triangle counts are identical: `--ssaa` changes only the raster workload.
+Triangle counts are identical across the three: `--ssaa` changes only per-pixel
+work. Geometry is flat, as expected.
 
-### Where the time goes
+### What the split says
 
-Measured per stage with `--bench`, not derived:
-
-| configuration | stream | geometry | raster | sky |
-|---|---|---|---|---|
-| `-n 4  --view 96 --ssaa 1` | 0.4% | **56.6%** | 25.6% | 16.6% |
-
-Earlier measurements, before the textured sky existed:
-
-| configuration | stream | geometry | raster |
-|---|---|---|---|
-| `-n 4  --view 96 --ssaa 1` | 0.2% | **68.1%** | 30.6% |
-| `-n 4  --view 96 --ssaa 4` | 0.1% | 19.1% | **76.8%** |
-| `-n 16 --view 96 --ssaa 1` | 0.2% | **83.1%** | 16.3% |
-
-Three things this says:
-
-1. **Streaming is not a bottleneck.** In steady state only a handful of chunks
-   are generated per frame; the cost is concentrated in the first frames, which
-   is why the benchmark has a warmup.
-2. **Geometry dominates as N grows**, because every explorer traverses its own
-   region of the world independently.
-3. **Raster dominates as `--ssaa` grows**, with the triangle count untouched.
+- **Geometry dominates as N grows** — 28% of the frame at one explorer, **86% at
+  sixteen** — because every explorer traverses its own region of the world
+  independently. Ambient occlusion made this stage heavier: it costs about 20%
+  of the frame overall.
+- **The sky is constant in N and quadratic in `--ssaa`.** The window is a fixed
+  size, so N views each cover 1/N of it. At `--ssaa 4` the sky costs *more than
+  the rasterizer* (284.9 ms against 266.7): the per-pixel cloud lookup is
+  three octaves of noise, and supersampling multiplies it by 16.
+- **Streaming stays under half a percent** in steady state and is not a target.
 
 There is no single bottleneck: which stage matters depends on the operating
 point. Pick the operating point before deciding what to optimize.
+
+### The 30 FPS floor
+
+**The sequential build does not reach 30 FPS at any configuration measured
+above** — 20.4 FPS at one explorer, 1.8 at sixteen. Recovering that floor is
+what the parallel version is for, but the arithmetic has to be faced: 8 cores
+mean 1.5x is comfortable at N = 1 and 17x is impossible at N = 16. Either the
+demo runs at a modest N, or the quality knobs come down, or both.
 
 ## Determinism
 
@@ -385,6 +415,12 @@ the byte-identical `--dump` check stops working.
 
 ## Known gaps
 
+- **The 30 FPS floor is not met sequentially** at any measured setting. See
+  above.
+- **The sky is disproportionately expensive**, and at high supersampling it
+  outweighs the rasterizer. The cloud lookup is three octaves of noise per sky
+  pixel; evaluating it at display resolution and upsampling, or caching it per
+  frame, would cut it sharply.
 - The first frames stream thousands of chunks at once and stall visibly. A
   per-frame generation budget would smooth it.
 - No frustum culling of chunks: the full disk around each camera is walked, even
@@ -392,6 +428,8 @@ the byte-identical `--dump` check stops working.
 - No distance fog, so the edge of the render distance is a hard horizon.
 - Trees on a chunk seam lose part of their canopy, the usual cost of generating
   chunks independently.
+- Terrain still reads as gentle from the air: the explorers fly high enough that
+  the relief is foreshortened.
 
 ## Layout
 

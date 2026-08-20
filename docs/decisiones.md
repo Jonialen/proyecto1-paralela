@@ -380,6 +380,14 @@ a dominar. Rango de alturas útil de 5 a 36 en vez de 8 a 19.
 
 Documentadas a propósito; están también en el `README.md`.
 
+- **El piso de 30 FPS no se cumple en la versión secuencial** en ninguna
+  configuración medida: 20.4 FPS con un explorador, 1.8 con dieciséis.
+  Recuperarlo es el objetivo de la versión paralela, pero con 8 núcleos hay que
+  aceptar la aritmética: 1.5x es cómodo con N = 1 y 17x es imposible con N = 16.
+- **El cielo es desproporcionadamente caro.** A `--ssaa 4` cuesta más que el
+  rasterizador (284.9 ms contra 266.7). La consulta de nubes son tres octavas de
+  ruido por píxel de cielo y el supermuestreo las multiplica por 16. Evaluarlo a
+  resolución de pantalla y ampliar, o cachearlo por frame, lo cortaría mucho.
 - Los primeros frames generan miles de chunks y producen un tirón visible. Un
   presupuesto de generación por frame lo suavizaría.
 - No hay descarte por *frustum* de chunks: se recorre el disco completo alrededor
@@ -387,3 +395,5 @@ Documentadas a propósito; están también en el `README.md`.
 - No hay niebla por distancia, así que el límite de render es un horizonte duro.
 - Los árboles sobre una costura de chunks pierden parte de la copa: costo
   habitual de generar chunks de forma independiente.
+- El relieve sigue leyéndose suave desde el aire: los exploradores vuelan lo
+  bastante alto como para escorzarlo.

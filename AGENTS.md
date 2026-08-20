@@ -33,6 +33,12 @@ The build **must stay clean under `-Wall -Wextra`**. Warnings here have caught
 real bugs, including signed integer overflow in the texture hash. Do not silence
 one without understanding it.
 
+Header dependencies are tracked with `-MMD -MP`. If you ever see an impossible
+crash right after editing a header, check that first: object files compiled
+against a stale struct layout corrupt memory in ways that look like a bug in
+whatever you just wrote. This happened here, and touching `world.h` used to
+rebuild exactly zero files.
+
 There is no unit test framework. Verification is:
 
 1. `make` with no warnings.
@@ -71,6 +77,16 @@ time it was a HUD text line, not the renderer.
 
 - **Measure, do not estimate.** An analytical model predicted 68 % vs 83 % wrong
   once already. Use `--bench`.
+- **Benchmark on an idle machine.** Frame times here are very sensitive to system
+  load. A busy desktop shifted every stage by the same 1.6x factor and looked
+  exactly like a regression in the change under test. If all stages move
+  together, suspect the machine before the code.
+- **Isolate one variable per A/B.** A fast-path comparison here reported a
+  mismatch that turned out to be a second, unrelated parameter changed between
+  the two captures.
+- **Tune terrain with `--survey`, not with impressions.** It prints a height
+  histogram and a biome census. Every terrain parameter in this project was set
+  from that output.
 - **Always warm up.** The first frames stream thousands of chunks; `--warmup`
   keeps that out of the steady-state average.
 - **Never use per-frame smoothing for a rate.** It is frame-rate dependent and
@@ -114,6 +130,18 @@ Breaking these is possible but must be deliberate and recorded in
   zero and tears the terrain along the negative axes.
 - **Noise is sampled in world coordinates.** Chunk-local sampling makes every
   chunk a disconnected island.
+- **Light is a per-vertex attribute.** Ambient occlusion varies across a face, so
+  the rasterizer interpolates it perspective-correct like the texture
+  coordinates. Do not collapse it back to a per-triangle constant.
+- **`neighbourhood_mask()` has a fast path for interior blocks.** Any change to
+  either path must be verified byte-for-byte against the other, not just
+  eyeballed.
+- **Texture packs are never committed.** `*.vxtx`, `*.zip`, `textures/` and
+  `packs/` are gitignored. The repository is made public for grading and
+  third-party art must not be redistributed. Packs are converted offline by
+  `scripts/make_texture_atlas.py`; the program has no PNG decoder on purpose.
+- **Procedural textures are the fallback and must keep working.** A missing or
+  malformed pack is reported and ignored, never fatal.
 
 ## Parallelization notes
 

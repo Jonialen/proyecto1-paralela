@@ -187,8 +187,11 @@ A(p)  =  ─────────────────────
 ```
 
 Se interpolan numerador y denominador por separado, y recién al final se divide.
-El código guarda `u_w = u/w`, `v_w = v/w` e `inv_w = 1/w` en cada
-`ScreenVertex`, precisamente para no recalcularlos por píxel:
+El código guarda `u_w = u/w`, `v_w = v/w`, `l_w = luz/w` e `inv_w = 1/w` en cada
+`ScreenVertex`, precisamente para no recalcularlos por píxel. La **luz** entró a
+esta lista cuando se agregó oclusión ambiental (§10.2): dejó de ser una constante
+por triángulo y pasó a ser un atributo por vértice, sujeto exactamente a la misma
+corrección que las coordenadas de textura.
 
 ```c
 float inv_w = l0*a->inv_w + l1*b->inv_w + l2*c->inv_w;
@@ -282,7 +285,65 @@ Esa decisión es la que permite generar cada chunk de forma independiente, en
 cualquier orden, y que aun así encajen sin costura. Es también lo que hace el
 streaming posible.
 
-### 8.5 División entera hacia abajo
+### 8.5 Deformación del dominio (*domain warping*)
+
+El fBm crudo produce manchas redondeadas que se leen como "procedurales". La
+deformación del dominio desplaza el **punto de muestreo** usando más ruido antes
+de leer el campo de altura:
+
+```
+wx = x/escala + (fBm₁(x, z) - 0.5) · fuerza
+wz = z/escala + (fBm₂(x, z) - 0.5) · fuerza
+h  = fBm(wx, wz)
+```
+
+Los dos campos de deformación usan semillas distintas, si no el desplazamiento
+sería diagonal y uniforme.
+
+El efecto es que las curvas de nivel se **doblan**: aparecen crestas, ensenadas y
+valles que parecen erosionados. Cuesta dos evaluaciones extra de ruido y cambia
+por completo el carácter del terreno. Es la técnica más barata que existe para
+que el ruido deje de parecer ruido.
+
+### 8.6 Ruido con crestas (*ridged*)
+
+```
+r(x, z) = (1 - |2·fBm(x, z) - 1|)²
+```
+
+El valor absoluto **pliega** el fBm alrededor de su punto medio: los valores
+cercanos a 0.5 se vuelven altos y los extremos se vuelven bajos. Donde el fBm
+tenía una transición suave por el medio, ahora hay un pico agudo. Elevar al
+cuadrado afila más esas crestas y aplana los valles.
+
+Es la diferencia entre montañas con filo y domos redondeados.
+
+**Combinación con la máscara.** La altura final es:
+
+```
+h = base + fBm·amplitud + máscara · (0.35 + 0.65·r) · amplitud_montaña
+```
+
+El piso `0.35` bajo el ridge no es cosmético. La versión anterior era
+`máscara · r · amplitud_montaña`, un **producto de dos campos que rara vez son
+altos a la vez**: el resultado era casi siempre casi cero y las montañas existían
+en la fórmula pero no en la pantalla. Con piso, donde la máscara dice "acá hay
+montañas" hay elevación real y el ridge solo decide si es cresta o ladera.
+
+### 8.7 Gradiente térmico
+
+Los campos de temperatura y humedad son ruido 2D independiente del relieve. Eso
+produce nieve a nivel del mar pegada a un desierto. La corrección es acoplarlos:
+
+```
+temperatura_efectiva = temperatura - (altura - nivel_del_mar) · 0.008
+```
+
+Es el gradiente térmico atmosférico. Además de ser físicamente correcto, resuelve
+las dos cosas a la vez: el frío se va a las alturas y los desiertos a las tierras
+bajas.
+
+### 8.8 División entera hacia abajo
 
 Para pasar de coordenada de mundo a coordenada de chunk hace falta división
 **hacia abajo**, no la división entera de C, que trunca hacia cero:
@@ -333,16 +394,60 @@ abajo para mantener el terreno en cuadro.
 
 ## 10. Iluminación
 
-Difusa lambertiana plana, una por cara:
+### 10.1 Término difuso
+
+Difusa lambertiana, una por cara:
 
 ```
-I = ambiente + (1 - ambiente) · max(0, n̂ · l̂)
+I_cara = ambiente + intensidad · max(0, n̂ · l̂)
 ```
 
-con `ambiente = 0.35`. La normal se transforma por la matriz de modelo. Como los
-bloques solo se trasladan, nunca rotan, la normal transformada coincide con la
-normal de la cara: seis valores posibles. Eso produce el sombreado plano por cara
-característico de los juegos de voxels.
+La normal se transforma por la matriz de modelo. Como los bloques solo se
+trasladan y nunca rotan, la normal transformada coincide con la normal de la
+cara: seis valores posibles.
+
+`ambiente` e `intensidad` **no son constantes**: los fija el ciclo día/noche
+(§14). De noche el sol se reemplaza por una luna tenue en dirección opuesta y
+baja el piso ambiental. Un vector de dirección solo no puede expresar eso, por
+eso la luz es una estructura.
+
+### 10.2 Oclusión ambiental
+
+Con solo el término difuso, **toda cara con la misma orientación tiene
+exactamente el mismo brillo**, sin importar qué la rodee. El terreno de voxels se
+ve de plástico. La oclusión ambiental es la corrección.
+
+Para cada una de las cuatro esquinas de una cara se miran tres vecinos: los dos
+que comparten arista con esa esquina (`lado₁`, `lado₂`) y el que está en
+diagonal (`esquina`). Con `1` = sólido:
+
+```
+nivel = (lado₁ ∧ lado₂) ? 0 : 3 - (lado₁ + lado₂ + esquina)
+sombra = {0.46, 0.65, 0.83, 1.0}[nivel]
+```
+
+**El caso especial es lo que importa.** Si los dos vecinos de arista están
+ocupados, la esquina está *sellada*: el diagonal ya no puede aclararla porque no
+hay camino por donde llegue luz. Sin esa regla, las esquinas interiores parpadean
+entre dos tonos según un bloque que el observador ni siquiera puede ver.
+
+**Cómo se obtienen los vecinos.** La cara tiene normal `n` sobre un eje. Los otros
+dos ejes son los que la cara *abarca*, y el signo de cada uno lo da la posición
+del vértice sobre ese eje. Con `t` y `u` esos dos vectores unitarios con signo:
+
+```
+lado₁  = n + t
+lado₂  = n + u
+esquina = n + t + u
+```
+
+El vecindario 3×3×3 se empaqueta en 27 bits con índice
+`(dx+1)·9 + (dy+1)·3 + (dz+1)`, así el generador de geometría lo calcula una vez
+por bloque visible y el emisor de caras solo consulta bits.
+
+**Consecuencia sobre el rasterizador.** La luz dejó de ser constante por
+triángulo: ahora varía entre los vértices, así que se interpola por píxel con la
+misma corrección de perspectiva que las coordenadas de textura (§7).
 
 ## 11. Supermuestreo
 
@@ -386,6 +491,84 @@ chunks (`4/π`) de terreno que nadie alcanza a ver.
 
 ---
 
+## 14. Cielo y ciclo día/noche
+
+### 14.1 Reconstrucción del rayo de vista
+
+El cielo necesita saber **hacia dónde mira** cada píxel. Se reconstruye a partir
+de la base ortonormal de la cámara, que es la misma que usa la proyección:
+
+```
+sx = ndc_x · tan(fov/2) · aspecto
+sy = ndc_y · tan(fov/2)
+d̂  = normalizar(adelante + derecha·sx + arriba·sy)
+```
+
+Es la operación inversa de la proyección de §4: en vez de llevar un punto del
+mundo a la pantalla, lleva un píxel de la pantalla a una dirección del mundo.
+
+### 14.2 Posición del sol
+
+```
+ángulo = 2π·(fase - 0.25)
+sol = normalizar( (cos·0.62,  sin,  cos·0.79) )
+```
+
+con `fase` = 0 medianoche, 0.25 amanecer, 0.5 mediodía, 0.75 atardecer. Las
+componentes horizontales desiguales inclinan el arco para que el sol no pase
+exactamente por el cenit.
+
+La elevación `sin(ángulo)` gobierna todo lo demás: la paleta del cielo, la
+visibilidad de las estrellas y los parámetros de `Light` de §10.1.
+
+**El crepúsculo tiene paleta propia**, no es una interpolación entre día y noche.
+Interpolando linealmente entre azul de día y azul de noche el naranja no aparece
+nunca, porque no está en ninguno de los dos extremos.
+
+### 14.3 Nubes: intersección rayo–plano
+
+Las nubes viven en un plano horizontal a altura `H` sobre la cámara. Para un rayo
+con dirección `d̂` desde el ojo `e`, el parámetro de intersección es:
+
+```
+s = H / d̂_y            (solo si d̂_y > 0)
+p = (e_x + d̂_x·s,  e_z + d̂_z·s)
+```
+
+y se muestrea el ruido en `p`. Eso es lo que les da **perspectiva**: como `s`
+crece sin límite cuando `d̂_y → 0`, las nubes se comprimen hacia el horizonte y
+se abren sobre la cabeza, igual que las de verdad. Pegar una textura plana sobre
+el cielo no produce ese efecto.
+
+Cerca del horizonte la intersección se estira tanto que el ruido se convertiría
+en bandas, así que se desvanece con `d̂_y`.
+
+### 14.4 Estrellas sin memoria
+
+Se cuantiza la dirección de vista sobre una retícula y se hashea:
+
+```
+estrella = hash(⌊d̂ₓ·k⌋, ⌊d̂_y·k⌋, ⌊d̂_z·k⌋) > umbral
+```
+
+No hay lista de estrellas ni textura: la posición **es** la consulta. Como
+depende solo de la dirección y no de la posición de la cámara, las estrellas
+quedan fijas en el cielo cuando el explorador se mueve, que es el comportamiento
+correcto para objetos en el infinito.
+
+### 14.5 Por qué el cielo se dibuja al final
+
+`sky_render()` corre **después** del terreno y escribe solo donde el buffer de
+profundidad sigue en el plano lejano. Los píxeles que el terreno tapa no se
+calculan nunca. En un frame típico el terreno cubre la mayor parte del panel, así
+que es la mayoría del trabajo descartado.
+
+Aun así el cielo es caro: a `--ssaa 4` cuesta más que el rasterizador, porque la
+consulta de nubes son tres octavas de ruido **por píxel de cielo** y el
+supermuestreo las multiplica por 16.
+
+---
+
 ## Referencias
 
 - Pineda, J. (1988). *A Parallel Algorithm for Polygon Rasterization*.
@@ -395,3 +578,7 @@ chunks (`4/π`) de terreno que nadie alcanza a ver.
 - Sutherland, I. y Hodgman, G. (1974). *Reentrant Polygon Clipping*. CACM.
 - Perlin, K. (1985). *An Image Synthesizer*. SIGGRAPH '85. — ruido y la función
   de interpolación suave.
+- Quilez, I. *Domain Warping*. — deformación del dominio aplicada a fBm.
+- Musgrave, F. K., Kolb, C. y Mace, R. (1989). *The Synthesis and Rendering of
+  Eroded Fractal Terrains*. SIGGRAPH '89. — ruido con crestas y terreno
+  fractal.
