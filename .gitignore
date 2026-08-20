@@ -9,8 +9,10 @@ cubeview
 # Texture packs and the atlases built from them. Third-party art must not be
 # redistributed: the repository is made public for grading, so packs stay out.
 *.vxtx
+*.zip
 textures/
 packs/
+docs/*.zip
 
 # Local tooling cache
 .atl/

@@ -172,13 +172,21 @@ several thousand lines of third-party code in a project whose brief asks for our
 own. The script does the decoding with ImageMagick and writes a raw block of
 pixels the program reads with one `fread`.
 
-Two details the converter handles, without which a pack looks wrong:
+Four details the converter handles, without which a pack looks wrong:
 
-- Grass and leaf textures ship **greyscale** in Minecraft packs; the game tints
-  them per biome at runtime. Loaded as-is they come out white, so the script
-  applies a fixed tint.
-- Water and fire are **animation strips**: a tall image holding N square frames.
-  Only the first frame is taken.
+- **Biome-tinted textures ship desaturated.** Grass, leaves *and water* are grey
+  in the files; the game tints them per biome at runtime. Loaded as-is, water
+  comes out grey. The script applies a fixed tint to each.
+- **Animation strips.** Water and fire are tall images holding N square frames;
+  only the first is taken. Grove's `water_still.png` is 64x4096, 64 frames.
+- **The grass side is an overlay.** In modern packs `grass_block_side.png` is
+  plain dirt, and the green fringe is a separate greyscale image the game tints
+  and composites on top. Without compositing it, grass blocks have bare dirt
+  sides.
+- **Variant folders.** CTM packs replace `stone.png` with `stone/1.png` through
+  `stone/8.png`. Candidates may name a directory, and a bare candidate must sit
+  directly in `block/` -- otherwise `stone.png` resolves to `block/button/stone.png`,
+  the stone *button*.
 
 Texture size is per-texture rather than a compile-time constant, so 16, 32, 64
 and 128 packs all work. Every pack uses a power-of-two edge, which keeps
