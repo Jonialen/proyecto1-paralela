@@ -10,6 +10,15 @@ SDL2 is used only to open a window and blit the finished framebuffer.
 This is the **sequential** version — the baseline the parallel version is
 measured against.
 
+## Licensing at a glance
+
+This repository ships **source only**: no executables, no object files, no
+third-party artwork. Textures are generated procedurally at startup and the HUD
+font is embedded in source, so nothing but SDL2 is needed to build and run it.
+
+Texture packs are optional, user-supplied and never committed. See
+[`THIRD_PARTY.md`](THIRD_PARTY.md).
+
 ## Documentation
 
 | File | Contents |
@@ -17,6 +26,7 @@ measured against.
 | `docs/matematica.md` | The maths behind each pipeline stage and why it is that way |
 | `docs/decisiones.md` | Design decision record: what, why, alternatives, consequences |
 | `AGENTS.md` | Working practices, invariants and the determinism contract |
+| `THIRD_PARTY.md` | Dependencies, and why no third-party asset ships here |
 
 ## Build and run
 
@@ -215,10 +225,14 @@ wrapping a single AND in the rasterizer's innermost loop.
 A pack that is missing, malformed or the wrong size is reported and **ignored**:
 the procedural set stays in place and the program keeps running.
 
-> Packs are not committed. `*.vxtx`, `textures/` and `packs/` are in
-> `.gitignore` — the repository is made public for grading, and third-party art
-> must not be redistributed. Note in your report which pack you used and where
-> to get it.
+> **Packs are never committed, and neither is the atlas built from one.** The
+> `.vxtx` file is a derivative work containing the pack's pixels and carries the
+> pack's licence exactly as the original files do. `*.zip`, `*.vxtx`,
+> `docs/*.zip`, `textures/` and `packs/` are all gitignored.
+>
+> Most resource packs forbid redistribution. Read the licence of any pack before
+> using it, and see [`THIRD_PARTY.md`](THIRD_PARTY.md) for what this project does
+> and does not include.
 
 ## Lighting
 

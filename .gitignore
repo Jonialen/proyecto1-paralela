@@ -1,6 +1,7 @@
 # Build artifacts -- the rubric asks for source only, no executables
 cubeview
 *.o
+*.d
 
 # Benchmark and debug output
 *.ppm
