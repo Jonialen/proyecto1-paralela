@@ -30,6 +30,7 @@ typedef struct {
     int block;
     int scene;
     int bench_frames;
+    int warmup_frames;
     const char *dump_path;
 } Options;
 
@@ -231,6 +232,12 @@ static void draw_viewport_borders(Framebuffer *fb, const Scene *scene)
 #define HUD_MARGIN 8
 #define HUD_MIN_FPS 30.0
 
+/* Frame rate is averaged over a fixed WINDOW OF TIME, not with a per-frame
+ * smoothing factor. A per-frame factor is frame-rate dependent: at 1 FPS a 0.9
+ * weight remembers several seconds, so one bad sample survives for ages. A time
+ * window behaves the same at 200 FPS and at 2 FPS. */
+#define FPS_WINDOW_SECONDS 0.35
+
 /* Draws the on-screen readout. The FPS number turns red below 30 because that
  * is the floor the project has to hold, so a failing frame rate is visible at a
  * glance instead of having to be read off a number.
@@ -317,6 +324,7 @@ static void print_usage(const char *prog)
     printf("      --scene NAME  'chunk' or 'block' (default chunk)\n");
     printf("      --block N     block index for the block scene, 0-%d\n", block_count() - 1);
     printf("      --bench N     render N frames headless and report timings\n");
+    printf("      --warmup N    untimed frames before the benchmark (default 3)\n");
     printf("      --dump PATH   render one frame headless into a binary PPM file\n");
     printf("      --help        show this message\n");
 }
@@ -387,6 +395,9 @@ static int parse_options(int argc, char **argv, Options *opt)
         } else if (!strcmp(flag, "--bench")) {
             if (!parse_int(argv[++i], flag, 1, 100000, &value)) return -1;
             opt->bench_frames = (int)value;
+        } else if (!strcmp(flag, "--warmup")) {
+            if (!parse_int(argv[++i], flag, 0, 10000, &value)) return -1;
+            opt->warmup_frames = (int)value;
         } else if (!strcmp(flag, "--scene")) {
             const char *name = argv[++i];
             if (!strcmp(name, "chunk")) {
@@ -493,10 +504,19 @@ static int run_benchmark(const Options *opt)
            opt->width, opt->height, opt->ssaa, fb.fb_width, fb.fb_height,
            opt->players, (double)opt->view_distance, opt->bench_frames);
 
+    /* Untimed warmup. The very first frames stream thousands of chunks at once,
+     * and averaging that startup cost into the steady-state figure understates
+     * the frame rate the screensaver actually sustains. */
+    for (int frame = 0; frame < opt->warmup_frames; frame++)
+        render_frame(&fb, &scene, (float)frame * BENCH_DT);
+    if (opt->warmup_frames > 0)
+        printf("Warmup:     %d frames (untimed)\n", opt->warmup_frames);
+
     size_t last_total = 0;
     double start = now_seconds();
     for (int frame = 0; frame < opt->bench_frames; frame++)
-        last_total = render_frame(&fb, &scene, (float)frame * BENCH_DT);
+        last_total = render_frame(&fb, &scene,
+                                  (float)(opt->warmup_frames + frame) * BENCH_DT);
     double elapsed = now_seconds() - start;
 
     double per_frame_ms = elapsed * 1000.0 / opt->bench_frames;
@@ -554,11 +574,10 @@ static int run_interactive(const Options *opt)
     layout_viewports(scene.views, scene.view_count, fb.fb_width, fb.fb_height);
 
     double start_time = now_seconds();
-    double last_time = start_time;
-    double title_timer = 0.0;
-    int frames_since_title = 0;
+    double window_start = start_time;
+    int window_frames = 0;
     size_t triangles = 0;
-    double fps = 0.0;
+    double fps = -1.0; /* negative until the first window closes: no fake reading */
     int running = 1;
 
     while (running) {
@@ -572,15 +591,6 @@ static int run_interactive(const Options *opt)
         }
 
         double current = now_seconds();
-        double dt = current - last_time;
-        last_time = current;
-
-        /* Exponential moving average: a raw per-frame reciprocal jitters too
-         * much to read, but a long window hides real stalls. */
-        if (dt > 0.0) {
-            double instant = 1.0 / dt;
-            fps = (fps <= 0.0) ? instant : fps * 0.9 + instant * 0.1;
-        }
 
         triangles = render_frame(&fb, &scene, (float)(current - start_time));
         draw_viewport_borders(&fb, &scene);
@@ -592,16 +602,20 @@ static int run_interactive(const Options *opt)
         SDL_RenderCopy(renderer, screen, NULL, NULL);
         SDL_RenderPresent(renderer);
 
-        frames_since_title++;
-        title_timer += dt;
-        if (title_timer >= 0.4) {
+        /* Counted after the frame is actually on screen, so the reading covers
+         * the whole frame: simulation, geometry, rasterization and present. */
+        window_frames++;
+        double window_elapsed = now_seconds() - window_start;
+        if (window_elapsed >= FPS_WINDOW_SECONDS) {
+            fps = (double)window_frames / window_elapsed;
+            window_start = now_seconds();
+            window_frames = 0;
+
             char title[224];
             snprintf(title, sizeof(title),
                      "Voxel Screensaver (sequential) | %d views | %zu tris | %.1f FPS",
-                     scene.view_count, triangles, frames_since_title / title_timer);
+                     scene.view_count, triangles, fps);
             SDL_SetWindowTitle(window, title);
-            title_timer = 0.0;
-            frames_since_title = 0;
         }
     }
 
@@ -618,7 +632,7 @@ static int run_interactive(const Options *opt)
 int main(int argc, char **argv)
 {
     Options opt = { 960, 720, 1, 1, 96.0f, 320.0f, WORLD_DEFAULT_MAX_CHUNKS,
-                    1337u, 0, SCENE_CHUNK, 0, NULL };
+                    1337u, 0, SCENE_CHUNK, 0, 3, NULL };
 
     textures_init();
 
