@@ -44,6 +44,7 @@ instead of tearing down buffers it cannot replace.
     --view N        render distance per explorer, world units  (default 96)
     --roam N        radius of the flight path, world units     (default 320)
     --max-chunks N  ceiling on resident chunks                 (default 6000)
+    --textures P    texture atlas built from a pack (see below)
     --daylen N      seconds for a full day/night cycle          (default 180)
     --seed N        terrain seed                               (default 1337)
     --width N       window width, minimum 640                  (default 960)
@@ -151,6 +152,42 @@ independently, in any order, and still line up seamlessly.
 Layering: snow above `snow_level`, sand at or below `sand_level`, otherwise grass
 over dirt over stone; ores scattered with a 3D hash; trees are a log trunk with a
 two-layer canopy. All knobs live in `TerrainParams`.
+
+## Texture packs
+
+Textures are procedural by default, so the program runs with no assets at all.
+A Minecraft-style pack can be used instead:
+
+```sh
+scripts/make_texture_atlas.py /path/to/pack build/pack.vxtx --size 32
+./cubeview -n 4 --textures build/pack.vxtx
+```
+
+**Packs are converted offline, not decoded at runtime.** The renderer has no PNG
+decoder on purpose: adding one would mean either a new build dependency or
+several thousand lines of third-party code in a project whose brief asks for our
+own. The script does the decoding with ImageMagick and writes a raw block of
+pixels the program reads with one `fread`.
+
+Two details the converter handles, without which a pack looks wrong:
+
+- Grass and leaf textures ship **greyscale** in Minecraft packs; the game tints
+  them per biome at runtime. Loaded as-is they come out white, so the script
+  applies a fixed tint.
+- Water and fire are **animation strips**: a tall image holding N square frames.
+  Only the first frame is taken.
+
+Texture size is per-texture rather than a compile-time constant, so 16, 32, 64
+and 128 packs all work. Every pack uses a power-of-two edge, which keeps
+wrapping a single AND in the rasterizer's innermost loop.
+
+A pack that is missing, malformed or the wrong size is reported and **ignored**:
+the procedural set stays in place and the program keeps running.
+
+> Packs are not committed. `*.vxtx`, `textures/` and `packs/` are in
+> `.gitignore` — the repository is made public for grading, and third-party art
+> must not be redistributed. Note in your report which pack you used and where
+> to get it.
 
 ## Sky and the day/night cycle
 
@@ -359,3 +396,4 @@ the byte-identical `--dump` check stops working.
 | `src/overlay.{h,c}` | Embedded 5x7 bitmap font and HUD primitives |
 | `src/main.c` | CLI, scene setup, split-screen layout, render loop, modes |
 | `scripts/sweep.sh` | Benchmark sweep used to produce the tables above |
+| `scripts/make_texture_atlas.py` | Converts a texture pack into the atlas format |

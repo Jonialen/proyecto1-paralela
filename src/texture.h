@@ -4,12 +4,20 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* Every texture is a 16x16 tile, exactly like a classic Minecraft block face.
- * Nearest-neighbour sampling is what gives the chunky pixel-art look. */
-#define TEX_SIZE 16
+/* Block faces are square tiles. The built-in procedural set is 16x16, like a
+ * classic Minecraft face, but a loaded texture pack may be 32, 64 or 128, so the
+ * edge length lives in the struct rather than in a macro.
+ *
+ * `mask` is `size - 1`. Every real pack uses a power-of-two edge, which keeps
+ * texture wrapping a single AND instead of a modulo in the innermost loop of
+ * the rasterizer. */
+#define TEX_PROCEDURAL_SIZE 16
+#define TEX_MAX_SIZE 512
 
 typedef struct {
-    uint32_t px[TEX_SIZE * TEX_SIZE]; /* 0x00RRGGBB */
+    uint32_t *px;  /* size * size pixels, 0x00RRGGBB */
+    int size;
+    int mask;
 } Texture;
 
 enum {
@@ -44,7 +52,21 @@ typedef struct {
 /* Block ids used by the voxel grid: 0 is air, id N is block_get(N - 1). */
 #define BLOCK_AIR 0
 
+/* Builds the procedural set. Always call this first: it is the fallback when no
+ * pack is given, and it guarantees every slot is valid even if a load fails
+ * halfway. */
 void textures_init(void);
+void textures_free(void);
+
+/* Replaces the procedural set with a pack atlas built by
+ * scripts/make_texture_atlas.py. Returns 0 and leaves the procedural textures
+ * untouched if the file is missing, malformed or the wrong size, so a bad pack
+ * degrades to the built-in look instead of taking the program down. */
+int textures_load_atlas(const char *path);
+
+/* Edge length currently in use, for reporting. */
+int textures_resolution(void);
+
 const Texture *texture_get(int id);
 
 int block_count(void);
@@ -58,11 +80,9 @@ int block_texture_for_face(const Block *block, int face);
 
 static inline uint32_t texture_sample(const Texture *t, float u, float v)
 {
-    int tx = (int)(u * TEX_SIZE);
-    int ty = (int)(v * TEX_SIZE);
-    tx &= TEX_SIZE - 1; /* wrap; TEX_SIZE is a power of two */
-    ty &= TEX_SIZE - 1;
-    return t->px[ty * TEX_SIZE + tx];
+    int tx = (int)(u * (float)t->size) & t->mask; /* wrap; size is a power of two */
+    int ty = (int)(v * (float)t->size) & t->mask;
+    return t->px[ty * t->size + tx];
 }
 
 #endif /* TEXTURE_H */

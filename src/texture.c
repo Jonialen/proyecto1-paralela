@@ -1,6 +1,16 @@
 #include "texture.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* The procedural generators all draw on a 16x16 grid. A loaded pack may be
+ * larger, but nothing in here needs to know that. */
+#define TEX_SIZE TEX_PROCEDURAL_SIZE
+
 static Texture g_textures[TEX_COUNT];
+static uint32_t *g_pixels;   /* one allocation backing every texture */
+static int g_resolution;
 
 /* Deterministic per-pixel hash so every run produces the exact same block art
  * (important when comparing sequential vs parallel output pixel by pixel). */
@@ -172,8 +182,49 @@ static void make_water(Texture *t)
     }
 }
 
+/* Points every texture at its slice of one contiguous allocation. Keeping them
+ * in a single block means one malloc, one free, and neighbouring textures share
+ * cache lines during rasterization. */
+static int textures_alloc(int size)
+{
+    size_t pixels = (size_t)TEX_COUNT * (size_t)size * (size_t)size;
+    uint32_t *block = calloc(pixels, sizeof(uint32_t));
+    if (!block)
+        return 0;
+
+    free(g_pixels);
+    g_pixels = block;
+    g_resolution = size;
+
+    for (int i = 0; i < TEX_COUNT; i++) {
+        g_textures[i].px = g_pixels + (size_t)i * size * size;
+        g_textures[i].size = size;
+        g_textures[i].mask = size - 1;
+    }
+    return 1;
+}
+
+void textures_free(void)
+{
+    free(g_pixels);
+    g_pixels = NULL;
+    g_resolution = 0;
+    for (int i = 0; i < TEX_COUNT; i++)
+        g_textures[i].px = NULL;
+}
+
+int textures_resolution(void)
+{
+    return g_resolution;
+}
+
 void textures_init(void)
 {
+    if (!textures_alloc(TEX_PROCEDURAL_SIZE)) {
+        fprintf(stderr, "Error: out of memory allocating the texture set\n");
+        exit(1);
+    }
+
     fill_noise(&g_textures[TEX_STONE], 122, 122, 122, 20, 11);
     make_cobble(&g_textures[TEX_COBBLE]);
     fill_noise(&g_textures[TEX_DIRT], 134, 96, 67, 18, 21);
@@ -190,6 +241,83 @@ void textures_init(void)
     make_water(&g_textures[TEX_WATER]);
     fill_noise(&g_textures[TEX_GRAVEL], 136, 132, 128, 30, 131);
     fill_noise(&g_textures[TEX_DRY_GRASS], 150, 156, 84, 20, 141);
+}
+
+/* Atlas file written by scripts/make_texture_atlas.py:
+ *
+ *   char     magic[4]  "VXTX"
+ *   uint32_t version   1
+ *   uint32_t count     number of textures, must match TEX_COUNT
+ *   uint32_t size      edge length, power of two
+ *   uint32_t pixels[count * size * size]   0x00RRGGBB, in TEX_* enum order
+ *
+ * A raw dump rather than PNG on purpose: decoding PNG would mean either a new
+ * dependency or several thousand lines of third-party code in a project whose
+ * brief asks for our own. The conversion happens offline instead. */
+int textures_load_atlas(const char *path)
+{
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        fprintf(stderr, "Error: cannot open texture atlas '%s'\n", path);
+        return 0;
+    }
+
+    char magic[4];
+    uint32_t header[3];
+    if (fread(magic, 1, 4, file) != 4 || fread(header, sizeof(uint32_t), 3, file) != 3) {
+        fprintf(stderr, "Error: '%s' is too short to be a texture atlas\n", path);
+        fclose(file);
+        return 0;
+    }
+    if (memcmp(magic, "VXTX", 4) != 0 || header[0] != 1u) {
+        fprintf(stderr, "Error: '%s' is not a version 1 texture atlas\n", path);
+        fclose(file);
+        return 0;
+    }
+
+    uint32_t count = header[1];
+    uint32_t size = header[2];
+    if (count != (uint32_t)TEX_COUNT) {
+        fprintf(stderr, "Error: '%s' holds %u textures, this build expects %d\n",
+                path, count, TEX_COUNT);
+        fclose(file);
+        return 0;
+    }
+    if (size < 8 || size > TEX_MAX_SIZE || (size & (size - 1)) != 0) {
+        fprintf(stderr, "Error: '%s' has edge %u; expected a power of two from 8 to %d\n",
+                path, size, TEX_MAX_SIZE);
+        fclose(file);
+        return 0;
+    }
+
+    /* Read into a scratch block first. Only once every pixel has arrived do the
+     * live textures get replaced, so a truncated file leaves the procedural set
+     * intact rather than half-overwritten. */
+    size_t pixel_count = (size_t)count * size * size;
+    uint32_t *scratch = malloc(pixel_count * sizeof(uint32_t));
+    if (!scratch) {
+        fprintf(stderr, "Error: out of memory reading '%s'\n", path);
+        fclose(file);
+        return 0;
+    }
+    if (fread(scratch, sizeof(uint32_t), pixel_count, file) != pixel_count) {
+        fprintf(stderr, "Error: '%s' is truncated\n", path);
+        free(scratch);
+        fclose(file);
+        return 0;
+    }
+    fclose(file);
+
+    if (!textures_alloc((int)size)) {
+        fprintf(stderr, "Error: out of memory resizing the texture set\n");
+        free(scratch);
+        return 0;
+    }
+    memcpy(g_pixels, scratch, pixel_count * sizeof(uint32_t));
+    free(scratch);
+
+    printf("Loaded texture pack: %s (%ux%u, %u textures)\n", path, size, size, count);
+    return 1;
 }
 
 const Texture *texture_get(int id)

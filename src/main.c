@@ -37,6 +37,7 @@ typedef struct {
     int scene;
     int bench_frames;
     int warmup_frames;
+    const char *texture_pack;
     const char *dump_path;
 } Options;
 
@@ -373,6 +374,7 @@ static void print_usage(const char *prog)
     printf("      --block N     block index for the block scene, 0-%d\n", block_count() - 1);
     printf("      --bench N     render N frames headless and report timings\n");
     printf("      --warmup N    untimed frames before the benchmark (default 3)\n");
+    printf("      --textures P  texture atlas from scripts/make_texture_atlas.py\n");
     printf("      --dump PATH   render one frame headless into a binary PPM file\n");
     printf("      --help        show this message\n");
 }
@@ -459,6 +461,8 @@ static int parse_options(int argc, char **argv, Options *opt)
                 fprintf(stderr, "Error: --scene expects 'chunk' or 'block', got '%s'\n", name);
                 return -1;
             }
+        } else if (!strcmp(flag, "--textures")) {
+            opt->texture_pack = argv[++i];
         } else if (!strcmp(flag, "--dump")) {
             opt->dump_path = argv[++i];
         } else {
@@ -770,7 +774,7 @@ static int run_interactive(const Options *opt)
 int main(int argc, char **argv)
 {
     Options opt = { 960, 720, 1, 1, 96.0f, 320.0f, WORLD_DEFAULT_MAX_CHUNKS,
-                    180.0f, 1337u, 0, SCENE_CHUNK, 0, 3, NULL };
+                    180.0f, 1337u, 0, SCENE_CHUNK, 0, 3, NULL, NULL };
 
     textures_init();
 
@@ -778,12 +782,22 @@ int main(int argc, char **argv)
     if (status == 0) return 0;
     if (status < 0) return 1;
 
-    if (opt.dump_path)
-        return run_dump(&opt);
-    if (opt.bench_frames > 0)
-        return run_benchmark(&opt);
+    /* A pack that fails to load leaves the procedural set in place, so the
+     * program still runs; the loader has already explained why on stderr. */
+    if (opt.texture_pack)
+        textures_load_atlas(opt.texture_pack);
 
-    printf("Controls: H or F1 toggles the HUD | F11 fullscreen | Esc or Q quits\n");
-    printf("          the window is resizable; panes re-tile and keep their aspect\n");
-    return run_interactive(&opt);
+    int result;
+    if (opt.dump_path) {
+        result = run_dump(&opt);
+    } else if (opt.bench_frames > 0) {
+        result = run_benchmark(&opt);
+    } else {
+        printf("Controls: H or F1 toggles the HUD | F11 fullscreen | Esc or Q quits\n");
+        printf("          the window is resizable; panes re-tile and keep their aspect\n");
+        result = run_interactive(&opt);
+    }
+
+    textures_free();
+    return result;
 }
