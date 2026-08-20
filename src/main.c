@@ -37,6 +37,7 @@ typedef struct {
     int scene;
     int bench_frames;
     int warmup_frames;
+    int survey;      /* sample the generator over N x N blocks and report */
     const char *texture_pack;
     const char *dump_path;
 } Options;
@@ -211,7 +212,8 @@ static void render_view(Framebuffer *fb, ViewTask *view, const Scene *scene, flo
     } else {
         view->triangle_count = cube_emit(&view->triangles, block_get(scene->block_index),
                                          mat4_identity(), vp, &scene->sky.light,
-                                         FACE_ALL, &view->viewport);
+                                         FACE_ALL, CUBE_NO_OCCLUSION,
+                                         &view->viewport);
     }
 
     double t1 = timings ? now_seconds() : 0.0;
@@ -394,6 +396,7 @@ static void print_usage(const char *prog)
     printf("      --warmup N    untimed frames before the benchmark (default 3)\n");
     printf("      --textures P  texture atlas from scripts/make_texture_atlas.py\n");
     printf("      --dump PATH   render one frame headless into a binary PPM file\n");
+    printf("      --survey N    sample terrain over an NxN block area and report\n");
     printf("      --help        show this message\n");
 }
 
@@ -481,6 +484,9 @@ static int parse_options(int argc, char **argv, Options *opt)
             }
         } else if (!strcmp(flag, "--textures")) {
             opt->texture_pack = argv[++i];
+        } else if (!strcmp(flag, "--survey")) {
+            if (!parse_int(argv[++i], flag, 16, 8192, &value)) return -1;
+            opt->survey = (int)value;
         } else if (!strcmp(flag, "--dump")) {
             opt->dump_path = argv[++i];
         } else {
@@ -614,6 +620,62 @@ static int run_benchmark(const Options *opt)
     scene_free(&scene);
     free(resolved);
     framebuffer_free(&fb);
+    return 0;
+}
+
+/* Samples the generator over a square area and reports what it actually
+ * produces. Arguing about whether terrain "looks flat" is guesswork; a height
+ * histogram and a biome census are not. */
+static int run_survey(const Options *opt)
+{
+    TerrainParams params = terrain_default(opt->seed);
+    int span = opt->survey;
+    int step = span > 512 ? span / 512 : 1;
+
+    const char *biome_names[] = { "ocean", "beach", "desert", "plains",
+                                  "forest", "tundra", "mountain" };
+    size_t biome_count[7] = { 0 };
+    size_t samples = 0;
+    int min_height = CHUNK_SIZE_Y, max_height = 0;
+    double sum = 0.0;
+
+    int buckets[CHUNK_SIZE_Y];
+    memset(buckets, 0, sizeof(buckets));
+
+    for (int z = -span / 2; z < span / 2; z += step) {
+        for (int x = -span / 2; x < span / 2; x += step) {
+            TerrainSample sample = terrain_sample(&params, x, z);
+            buckets[sample.height]++;
+            biome_count[sample.biome]++;
+            if (sample.height < min_height) min_height = sample.height;
+            if (sample.height > max_height) max_height = sample.height;
+            sum += sample.height;
+            samples++;
+        }
+    }
+
+    printf("Terrain survey: %dx%d blocks, seed %u, %zu samples\n",
+           span, span, opt->seed, samples);
+    printf("Height: min %d, max %d, mean %.1f, sea level %d, snow line %d\n\n",
+           min_height, max_height, sum / (double)samples,
+           params.sea_level, params.snow_line);
+
+    printf("Height distribution\n");
+    for (int h = 0; h < CHUNK_SIZE_Y; h++) {
+        if (buckets[h] == 0)
+            continue;
+        double pct = 100.0 * (double)buckets[h] / (double)samples;
+        printf("  %3d %s%5.1f%%", h, h == params.sea_level ? "<-sea " : "      ", pct);
+        int bar = (int)(pct * 2.0);
+        for (int i = 0; i < bar && i < 60; i++)
+            putchar('#');
+        putchar('\n');
+    }
+
+    printf("\nBiomes\n");
+    for (int b = 0; b < 7; b++)
+        printf("  %-9s %5.1f%%\n", biome_names[b],
+               100.0 * (double)biome_count[b] / (double)samples);
     return 0;
 }
 
@@ -792,7 +854,7 @@ static int run_interactive(const Options *opt)
 int main(int argc, char **argv)
 {
     Options opt = { 960, 720, 1, 1, 96.0f, 320.0f, WORLD_DEFAULT_MAX_CHUNKS,
-                    180.0f, 1337u, 0, SCENE_CHUNK, 0, 3, NULL, NULL };
+                    180.0f, 1337u, 0, SCENE_CHUNK, 0, 3, 0, NULL, NULL };
 
     textures_init();
 
@@ -804,6 +866,12 @@ int main(int argc, char **argv)
      * program still runs; the loader has already explained why on stderr. */
     if (opt.texture_pack)
         textures_load_atlas(opt.texture_pack);
+
+    if (opt.survey > 0) {
+        int survey_result = run_survey(&opt);
+        textures_free();
+        return survey_result;
+    }
 
     int result;
     if (opt.dump_path) {

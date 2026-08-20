@@ -154,6 +154,7 @@ int tribuf_push(TriangleBuffer *buf, const ScreenTriangle *tri)
 typedef struct {
     Vec4 clip;
     float u, v;
+    float light;   /* per-vertex, so ambient occlusion survives clipping */
 } ClipVertex;
 
 static ClipVertex clip_lerp(ClipVertex a, ClipVertex b, float t)
@@ -165,6 +166,7 @@ static ClipVertex clip_lerp(ClipVertex a, ClipVertex b, float t)
     r.clip.w = a.clip.w + (b.clip.w - a.clip.w) * t;
     r.u = a.u + (b.u - a.u) * t;
     r.v = a.v + (b.v - a.v) * t;
+    r.light = a.light + (b.light - a.light) * t;
     return r;
 }
 
@@ -207,6 +209,7 @@ static ScreenVertex to_screen(ClipVertex c, const Viewport *view)
     s.inv_w = inv_w;
     s.u_w = c.u * inv_w;
     s.v_w = c.v * inv_w;
+    s.l_w = c.light * inv_w;
     return s;
 }
 
@@ -219,7 +222,7 @@ static int imax(int a, int b) { return a > b ? a : b; }
 static int imin(int a, int b) { return a < b ? a : b; }
 
 /* Culls, bounds and appends one triangle. Returns 1 if it was kept. */
-static int emit_triangle(TriangleBuffer *out, const Texture *tex, float light,
+static int emit_triangle(TriangleBuffer *out, const Texture *tex,
                          ScreenVertex a, ScreenVertex b, ScreenVertex c,
                          const Viewport *view)
 {
@@ -233,7 +236,6 @@ static int emit_triangle(TriangleBuffer *out, const Texture *tex, float light,
     tri.v[1] = b;
     tri.v[2] = c;
     tri.tex = tex;
-    tri.light = light;
     /* Clamped to the viewport, so geometry from one camera can never bleed into
      * a neighbouring split-screen pane. */
     tri.min_x = imax(view->x, (int)floorf(fminf(fminf(a.x, b.x), c.x)));
@@ -248,8 +250,54 @@ static int emit_triangle(TriangleBuffer *out, const Texture *tex, float light,
     return tribuf_push(out, &tri);
 }
 
+static int occlusion_bit(uint32_t occlusion, int dx, int dy, int dz)
+{
+    return (int)((occlusion >> ((dx + 1) * 9 + (dy + 1) * 3 + (dz + 1))) & 1u);
+}
+
+/* Ambient occlusion for one corner of one face.
+ *
+ * A corner is darkened by the two neighbours that share its edges and by the
+ * one diagonally across. The special case matters: when BOTH edge neighbours
+ * are solid the corner is sealed, and the diagonal cannot make it brighter --
+ * without that rule, inside corners flicker between two shades depending on a
+ * block you cannot even see. */
+static float vertex_occlusion(uint32_t occlusion, Vec3 normal, Vec3 pos)
+{
+    int n[3] = { (int)normal.x, (int)normal.y, (int)normal.z };
+    float p[3] = { pos.x, pos.y, pos.z };
+
+    /* The face spans the two axes its normal is zero on. Which way each one
+     * points is decided by which corner of the face this vertex is. */
+    int t[3] = { 0, 0, 0 };
+    int u[3] = { 0, 0, 0 };
+    int found = 0;
+    for (int axis = 0; axis < 3; axis++) {
+        if (n[axis] != 0)
+            continue;
+        int sign = (p[axis] > 0.0f) ? 1 : -1;
+        if (found == 0)
+            t[axis] = sign;
+        else
+            u[axis] = sign;
+        found++;
+    }
+
+    int side1 = occlusion_bit(occlusion, n[0] + t[0], n[1] + t[1], n[2] + t[2]);
+    int side2 = occlusion_bit(occlusion, n[0] + u[0], n[1] + u[1], n[2] + u[2]);
+    int corner = occlusion_bit(occlusion,
+                               n[0] + t[0] + u[0],
+                               n[1] + t[1] + u[1],
+                               n[2] + t[2] + u[2]);
+
+    int level = (side1 && side2) ? 0 : 3 - (side1 + side2 + corner);
+    static const float shade[4] = { 0.46f, 0.65f, 0.83f, 1.0f };
+    return shade[level];
+}
+
 size_t cube_emit(TriangleBuffer *out, const Block *block, Mat4 model, Mat4 vp,
-                 const Light *light, unsigned face_mask, const Viewport *view)
+                 const Light *light, unsigned face_mask, uint32_t occlusion,
+                 const Viewport *view)
 {
     if (!block || (face_mask & FACE_ALL) == 0)
         return 0;
@@ -279,6 +327,8 @@ size_t cube_emit(TriangleBuffer *out, const Block *block, Mat4 model, Mat4 vp,
             quad[i].clip = mat4_mul_vec4(mvp, p);
             quad[i].u = f->v[i].u;
             quad[i].v = f->v[i].v;
+            quad[i].light = light_term *
+                            vertex_occlusion(occlusion, f->normal, f->v[i].pos);
         }
 
         /* Clipping one quad against one plane yields at most 5 vertices. */
@@ -292,7 +342,7 @@ size_t cube_emit(TriangleBuffer *out, const Block *block, Mat4 model, Mat4 vp,
             sv[i] = to_screen(poly[i], view);
 
         for (int i = 1; i + 1 < count; i++)
-            emitted += (size_t)emit_triangle(out, tex, light_term,
+            emitted += (size_t)emit_triangle(out, tex,
                                              sv[0], sv[i], sv[i + 1], view);
     }
 
@@ -351,10 +401,12 @@ void raster_triangle(Framebuffer *fb, const ScreenTriangle *tri,
             float u = (l0 * a->u_w + l1 * b->u_w + l2 * c->u_w) * w;
             float v = (l0 * a->v_w + l1 * b->v_w + l2 * c->v_w) * w;
 
+            float light = (l0 * a->l_w + l1 * b->l_w + l2 * c->l_w) * w;
+
             uint32_t texel = texture_sample(tri->tex, u, v);
-            int r = (int)(((texel >> 16) & 0xFF) * tri->light);
-            int g = (int)(((texel >> 8) & 0xFF) * tri->light);
-            int bl = (int)((texel & 0xFF) * tri->light);
+            int r = (int)(((texel >> 16) & 0xFF) * light);
+            int g = (int)(((texel >> 8) & 0xFF) * light);
+            int bl = (int)((texel & 0xFF) * light);
 
             fb->depth[idx] = z;
             fb->color[idx] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)bl;

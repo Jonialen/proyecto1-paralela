@@ -51,6 +51,7 @@ typedef struct {
     float z;        /* NDC depth in [-1, 1] */
     float inv_w;    /* 1/w */
     float u_w, v_w; /* u/w and v/w, which DO interpolate linearly on screen */
+    float l_w;      /* light/w: ambient occlusion varies across the face now */
 } ScreenVertex;
 
 /* One ready-to-rasterize triangle. The screen bounding box is precomputed and
@@ -59,7 +60,6 @@ typedef struct {
 typedef struct {
     ScreenVertex v[3];
     const Texture *tex;
-    float light;
     int min_x, min_y, max_x, max_y;
 } ScreenTriangle;
 
@@ -108,8 +108,16 @@ enum {
  * The cube is a unit cube centred on the model-space origin.
  * `light_dir` must already be normalized. Returns the number of triangles
  * appended. */
+/* `occlusion` is a 27-bit map of the 3x3x3 neighbourhood, indexed
+ * (dx+1)*9 + (dy+1)*3 + (dz+1), with a bit set where that neighbour is solid.
+ * It drives per-vertex ambient occlusion: without it every face of a given
+ * orientation renders at exactly the same brightness and the terrain looks
+ * like flat plastic. Pass CUBE_NO_OCCLUSION for a cube standing on its own. */
+#define CUBE_NO_OCCLUSION 0u
+
 size_t cube_emit(TriangleBuffer *out, const Block *block, Mat4 model, Mat4 vp,
-                 const Light *light, unsigned face_mask, const Viewport *view);
+                 const Light *light, unsigned face_mask, uint32_t occlusion,
+                 const Viewport *view);
 
 /* ---------------------------------------------------------- raster stage */
 

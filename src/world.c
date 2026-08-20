@@ -82,13 +82,13 @@ TerrainParams terrain_default(uint32_t seed)
     p.octaves = 4;
     p.lacunarity = 2.0f;
     p.gain = 0.5f;
-    p.base_height = 6.0f;
-    p.amplitude = 16.0f;
-    p.mountain_amplitude = 22.0f;
+    p.base_height = 4.0f;
+    p.amplitude = 20.0f;
+    p.mountain_amplitude = 26.0f;
     p.warp_strength = 0.55f;
-    p.sea_level = 12;
-    p.beach_margin = 2;
-    p.snow_line = 34;
+    p.sea_level = 10;
+    p.beach_margin = 1;
+    p.snow_line = 32;
     p.tree_chance = 0.05f;
     return p;
 }
@@ -145,9 +145,16 @@ TerrainSample terrain_sample(const TerrainParams *params, int world_x, int world
     float ridge = noise_ridged_2d(nx * 1.15f, nz * 1.15f,
                                   params->seed + 4401u, 4, 2.0f, 0.5f);
 
+    /* The mountain term is gated by the mask but NOT purely multiplied by the
+     * ridge. A plain mask*ridge product is high only when both fields happen to
+     * peak together, which is rare, so mountains ended up existing on paper and
+     * never on screen. Keeping a floor under the ridge means that wherever the
+     * mask says "mountains here", there is real elevation; the ridge then
+     * decides whether it is a crest or a shoulder. */
+    float relief = 0.35f + 0.65f * ridge;
     float h = params->base_height
             + base * params->amplitude
-            + mask * ridge * params->mountain_amplitude;
+            + mask * relief * params->mountain_amplitude;
 
     TerrainSample sample;
     sample.height = (int)h;
@@ -161,12 +168,22 @@ TerrainSample terrain_sample(const TerrainParams *params, int world_x, int world
     float humidity = noise_fbm_2d(nx * 0.19f - 23.0f, nz * 0.19f + 29.0f,
                                   params->seed + 8802u, 2, 2.0f, 0.5f);
 
+    /* Lapse rate: temperature falls with altitude. Climate fields sampled on
+     * their own are independent of the relief, which put snow at sea level
+     * right beside a desert. Coupling them is both physically right and the fix
+     * -- cold ends up on the heights, deserts in the warm lowlands. */
+    temperature -= (float)(sample.height - params->sea_level) * 0.008f;
+
     /* Height wins over climate: an ocean is an ocean whatever the weather. */
     if (sample.height <= params->sea_level)
         sample.biome = BIOME_OCEAN;
     else if (sample.height <= params->sea_level + params->beach_margin)
         sample.biome = BIOME_BEACH;
-    else if (sample.height >= params->snow_line || mask > 0.55f)
+    /* Mountain needs actual altitude, not just a high mask. Deciding by mask
+     * alone painted bare stone at sea level wherever the mask happened to be
+     * high but the terrain was not. */
+    else if (sample.height >= params->snow_line ||
+             (mask > 0.5f && sample.height > params->sea_level + 12))
         sample.biome = BIOME_MOUNTAIN;
     else if (temperature > 0.60f && humidity < 0.42f)
         sample.biome = BIOME_DESERT;
@@ -607,6 +624,65 @@ static unsigned face_mask_at(const Chunk *chunk, const ChunkNeighbors *n,
     return mask;
 }
 
+/* Packs the 3x3x3 neighbourhood of one block into 27 bits, indexed
+ * (dx+1)*9 + (dy+1)*3 + (dz+1). Ambient occlusion needs the diagonals, which
+ * the six-way face mask never looks at. Only built for blocks that actually
+ * show a face, so fully buried blocks still cost nothing. */
+static uint32_t neighbourhood_mask(const Chunk *chunk, const ChunkNeighbors *n,
+                                   int x, int y, int z)
+{
+    uint32_t mask = 0;
+
+    /* Fast path for a block whose whole neighbourhood lies inside this chunk,
+     * which is the overwhelming majority. Straight indexing with no bounds
+     * checks and no cross-chunk lookups; the generic path below only runs on
+     * the shell. This matters because the mask is built for every visible
+     * block and the branch-heavy version doubled the geometry stage. */
+    if (x > 0 && x < CHUNK_SIZE_X - 1 &&
+        y > 0 && y < CHUNK_SIZE_Y - 1 &&
+        z > 0 && z < CHUNK_SIZE_Z - 1) {
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                const uint8_t *row = &chunk->blocks[chunk_index(x - 1, y + dy, z + dz)];
+                for (int dx = 0; dx < 3; dx++)
+                    if (row[dx] != BLOCK_AIR)
+                        mask |= 1u << (dx * 9 + (dy + 1) * 3 + (dz + 1));
+            }
+        }
+        return mask;
+    }
+
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dz = -1; dz <= 1; dz++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                int bx = x + dx, by = y + dy, bz = z + dz;
+                uint8_t id;
+
+                if (by < 0 || by >= CHUNK_SIZE_Y) {
+                    id = BLOCK_AIR;
+                } else if (bx >= 0 && bx < CHUNK_SIZE_X &&
+                           bz >= 0 && bz < CHUNK_SIZE_Z) {
+                    id = chunk->blocks[chunk_index(bx, by, bz)];
+                } else if (bx < 0) {
+                    id = chunk_get(n->neg_x, CHUNK_SIZE_X - 1, by,
+                                   bz < 0 ? CHUNK_SIZE_Z - 1 : (bz >= CHUNK_SIZE_Z ? 0 : bz));
+                } else if (bx >= CHUNK_SIZE_X) {
+                    id = chunk_get(n->pos_x, 0, by,
+                                   bz < 0 ? CHUNK_SIZE_Z - 1 : (bz >= CHUNK_SIZE_Z ? 0 : bz));
+                } else if (bz < 0) {
+                    id = chunk_get(n->neg_z, bx, by, CHUNK_SIZE_Z - 1);
+                } else {
+                    id = chunk_get(n->pos_z, bx, by, 0);
+                }
+
+                if (id != BLOCK_AIR)
+                    mask |= 1u << ((dx + 1) * 9 + (dy + 1) * 3 + (dz + 1));
+            }
+        }
+    }
+    return mask;
+}
+
 size_t world_emit_view(TriangleBuffer *out, const World *world, Vec3 camera_pos,
                        float render_radius, Mat4 vp, const Light *light,
                        const Viewport *view)
@@ -658,11 +734,17 @@ size_t world_emit_view(TriangleBuffer *out, const World *world, Vec3 camera_pos,
                         if (!block)
                             continue;
 
+                        /* Ambient occlusion needs the diagonals, which the
+                         * six-way face mask never looks at. Only built for
+                         * blocks that actually show a face. */
+                        uint32_t occlusion = neighbourhood_mask(chunk, &neighbors,
+                                                                x, y, z);
+
                         Mat4 model = mat4_translate(base_x + (float)x + 0.5f,
                                                     (float)y + 0.5f,
                                                     base_z + (float)z + 0.5f);
                         emitted += cube_emit(out, block, model, vp, light,
-                                             mask, view);
+                                             mask, occlusion, view);
                     }
                 }
             }

@@ -316,6 +316,66 @@ ocupan memoria.
 
 ---
 
+## D-17. Oclusión ambiental por vértice
+
+**Contexto.** El terreno se veía "de plástico": toda cara con la misma
+orientación tenía exactamente el mismo brillo, sin importar qué la rodeara.
+
+**Decisión.** Oclusión ambiental por vértice, calculada en la etapa de
+geometría. `cube_emit()` recibe un mapa de 27 bits del vecindario 3x3x3 y
+oscurece cada esquina según sus tres vecinos (dos de arista, uno diagonal).
+
+**La regla que importa.** Si las **dos** aristas están ocupadas, la esquina está
+sellada y la diagonal ya no puede aclararla. Sin ese caso especial, las esquinas
+interiores parpadean entre dos tonos según un bloque que ni siquiera se ve.
+
+**Consecuencias.** La luz pasó de ser por triángulo a por vértice: `ScreenVertex`
+lleva `l_w` y el rasterizador la interpola con corrección de perspectiva, igual
+que las coordenadas de textura. `ClipVertex` también, para que sobreviva al
+recorte.
+
+**Costo medido.** El frame pasó de 135.4 a 162.1 ms (+20 %); la geometría de
+87.7 a 112.7 ms (+29 %). Es la mejora visual más grande disponible y por eso se
+pagó.
+
+**Optimización.** Construir la máscara con comprobaciones de límites por vecino
+duplicaba la etapa de geometría. Hay un camino rápido para bloques cuyo vecindario
+cae entero dentro del chunk (la enorme mayoría): indexación directa, sin ramas.
+Ahorra 14 % y se verificó **byte a byte** contra el camino genérico.
+
+---
+
+## D-18. El terreno se ajusta con datos, no con opiniones
+
+**Contexto.** "El terreno no me convence" no es accionable.
+
+**Decisión.** `--survey N` muestrea el generador sobre un área de N x N bloques e
+imprime un histograma de alturas y un censo de biomas.
+
+**Lo que reveló.** El 78 % del mundo estaba entre altura 8 y 19 -- una franja de
+11 bloques -- con un máximo de 41 que aparecía en el 0.1 % de los casos. Las
+montañas existían y nunca se veían. El 48 % era agua o playa, y `beach_margin=2`
+cubría justo las alturas 13-14, que eran el pico exacto de la distribución.
+
+**Causa.** La contribución montañosa era `mask * ridge * amplitud`: un **producto
+de dos campos que rara vez son altos a la vez**, así que casi siempre daba casi
+cero. Ahora el ridge tiene piso (`0.35 + 0.65*ridge`): donde la máscara dice
+"acá hay montañas", hay elevación real, y el ridge solo decide si es cresta o
+ladera.
+
+**Segundo hallazgo.** El bioma montaña se elegía por la máscara sola, lo que
+pintaba piedra desnuda a nivel del mar. Ahora exige altura real.
+
+**Tercero.** Los campos de temperatura y humedad eran independientes del relieve,
+así que aparecía nieve a nivel del mar pegada a un desierto. Se acopló la
+temperatura a la altitud (gradiente térmico), que además de ser físicamente
+correcto pone el frío en las alturas y los desiertos en las tierras bajas.
+
+**Resultado.** Océano 29 % -> 17 %, playa 19 % -> 6 %, y bosque y llanura pasaron
+a dominar. Rango de alturas útil de 5 a 36 en vez de 8 a 19.
+
+---
+
 ## Limitaciones conocidas
 
 Documentadas a propósito; están también en el `README.md`.
