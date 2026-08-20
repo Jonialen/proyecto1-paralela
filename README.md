@@ -25,7 +25,17 @@ make            # requires SDL2 development headers
 ./cubeview -n 4
 ```
 
-`Esc` or `Q` closes the window.
+| Key | Action |
+|---|---|
+| `H` or `F1` | Hide the HUD and just watch |
+| `F11` | Fullscreen |
+| `Esc` or `Q` | Quit |
+
+The window is resizable. Framebuffer, resolve buffer, streaming texture and
+viewport layout are rebuilt on resize, and each pane recomputes its own aspect
+ratio so views are never stretched. New surfaces are allocated before the old
+ones are released, so a resize that runs out of memory keeps the previous size
+instead of tearing down buffers it cannot replace.
 
 ## Usage
 
@@ -34,6 +44,7 @@ make            # requires SDL2 development headers
     --view N        render distance per explorer, world units  (default 96)
     --roam N        radius of the flight path, world units     (default 320)
     --max-chunks N  ceiling on resident chunks                 (default 6000)
+    --daylen N      seconds for a full day/night cycle          (default 180)
     --seed N        terrain seed                               (default 1337)
     --width N       window width, minimum 640                  (default 960)
     --height N      window height, minimum 480                 (default 720)
@@ -141,6 +152,29 @@ Layering: snow above `snow_level`, sand at or below `sand_level`, otherwise gras
 over dirt over stone; ores scattered with a 3D hash; trees are a log trunk with a
 two-layer canopy. All knobs live in `TerrainParams`.
 
+## Sky and the day/night cycle
+
+`src/sky.c` derives everything from one phase value: 0 is midnight, 0.25
+sunrise, 0.5 noon, 0.75 sunset. The same state drives the background **and** the
+terrain shading, so the world darkens with the sky instead of staying lit under
+a black one. At night the sun is replaced by a dim moon from the opposite
+direction and the ambient floor drops, which is why the light is a `Light`
+struct (direction, ambient, intensity) rather than a bare vector.
+
+- **Gradient** blended between three palettes. Twilight is not an interpolation
+  of day and night: it has its own warm horizon, which is what makes a sunrise
+  read as a sunrise.
+- **Clouds** live on a horizontal plane above the camera. Intersecting the view
+  ray with that plane is what gives them perspective — they spread overhead and
+  compress towards the horizon instead of being pasted flat on the sky.
+- **Stars** are hashed from a quantized view direction, so they cost no memory
+  and stay fixed as the camera turns.
+- **Sun and moon** are a disc plus a `dot^32` glow.
+
+The sky is drawn **after** the terrain and writes only where the depth buffer is
+still at the far plane. Sky pixels hidden by terrain are never computed, which
+on a typical frame is most of the pane.
+
 ## Architecture
 
 ```
@@ -234,6 +268,12 @@ Triangle counts are identical: `--ssaa` changes only the raster workload.
 
 Measured per stage with `--bench`, not derived:
 
+| configuration | stream | geometry | raster | sky |
+|---|---|---|---|---|
+| `-n 4  --view 96 --ssaa 1` | 0.4% | **56.6%** | 25.6% | 16.6% |
+
+Earlier measurements, before the textured sky existed:
+
 | configuration | stream | geometry | raster |
 |---|---|---|---|
 | `-n 4  --view 96 --ssaa 1` | 0.2% | **68.1%** | 30.6% |
@@ -314,6 +354,7 @@ the byte-identical `--dump` check stops working.
 | `src/texture.{h,c}` | Procedural 16x16 block textures and block definitions |
 | `src/camera.{h,c}` | Explorer flight path, view-projection, stream radius |
 | `src/render.{h,c}` | Framebuffer, viewports, `cube_emit()`, rasterizer |
+| `src/sky.{h,c}` | Day/night cycle, sky gradient, clouds, stars, sun and moon |
 | `src/world.{h,c}` | Chunk map, streaming, eviction, terrain, `world_emit_view()` |
 | `src/overlay.{h,c}` | Embedded 5x7 bitmap font and HUD primitives |
 | `src/main.c` | CLI, scene setup, split-screen layout, render loop, modes |

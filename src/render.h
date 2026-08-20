@@ -41,12 +41,6 @@ static inline float viewport_aspect(const Viewport *view)
     return (float)view->width / (float)view->height;
 }
 
-/* Paints a vertical gradient over one viewport, colour only. Depth is left
- * alone, so this runs after framebuffer_clear() and before the geometry. Each
- * viewport gets its own gradient because the panes are stacked: a single
- * framebuffer-wide gradient would put the horizon in the wrong place. */
-void framebuffer_sky(Framebuffer *fb, const Viewport *view,
-                     uint32_t top, uint32_t horizon);
 
 /* ------------------------------------------------------ geometry output */
 
@@ -83,6 +77,16 @@ int tribuf_push(TriangleBuffer *buf, const ScreenTriangle *tri);
 
 /* ------------------------------------------------------------ cube stage */
 
+/* Directional light. Bundling direction with ambient and intensity is what lets
+ * a day/night cycle darken the whole world: at night the sun is replaced by a
+ * dim moon and the ambient floor drops, which a bare direction vector could not
+ * express. */
+typedef struct {
+    Vec3 direction;  /* normalized, points TOWARD the light source */
+    float ambient;   /* floor applied to every face, 0..1 */
+    float intensity; /* scales the diffuse term, 0..1 */
+} Light;
+
 /* Face bits, in the same order as the internal cube_faces[] table:
  * +X, -X, +Y, -Y, +Z, -Z. A chunk clears the bit of every face that touches a
  * solid neighbour, which is what keeps a 4096-block chunk affordable. */
@@ -105,7 +109,7 @@ enum {
  * `light_dir` must already be normalized. Returns the number of triangles
  * appended. */
 size_t cube_emit(TriangleBuffer *out, const Block *block, Mat4 model, Mat4 vp,
-                 Vec3 light_dir, unsigned face_mask, const Viewport *view);
+                 const Light *light, unsigned face_mask, const Viewport *view);
 
 /* ---------------------------------------------------------- raster stage */
 

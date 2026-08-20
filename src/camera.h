@@ -51,6 +51,11 @@ Camera camera_make(int index, int count, float roam_radius,
 /* Where the camera is at time `t`, in world units. */
 Vec3 camera_position(const Camera *camera, float t);
 
+/* Orthonormal camera basis at time `t`. The sky needs the same basis the
+ * projection uses, so it is computed once here instead of twice. */
+void camera_basis(const Camera *camera, float t,
+                  Vec3 *eye, Vec3 *forward, Vec3 *right, Vec3 *up);
+
 /* View-projection matrix for this camera at time `t`. `aspect` comes from the
  * viewport, not the window, so split-screen panes are not stretched. */
 Mat4 camera_view_proj(const Camera *camera, float t, float aspect);

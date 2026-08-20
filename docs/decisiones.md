@@ -282,6 +282,40 @@ diagnóstico.
 
 ---
 
+## D-15. El ciclo día/noche gobierna la luz, no solo el fondo
+
+**Decisión.** Un único valor de fase produce a la vez el degradado del cielo y la
+`Light` con que se sombrea el terreno.
+
+**Motivo.** Si el ciclo solo pintara el fondo, de noche quedaría un cielo negro
+sobre un terreno iluminado a pleno sol. Por eso la luz pasó de ser un `Vec3` a
+una estructura con dirección, ambiente e intensidad: de noche el sol se
+reemplaza por una luna tenue en dirección opuesta **y** baja el piso ambiental,
+algo que un vector de dirección solo no puede expresar.
+
+**Detalle.** El crepúsculo no es una interpolación entre día y noche: tiene su
+propia paleta con horizonte cálido. Interpolando linealmente entre azul de día y
+azul de noche nunca aparece un amanecer.
+
+---
+
+## D-16. El cielo se dibuja después del terreno
+
+**Decisión.** `sky_render()` corre al final de `render_view()` y escribe solo
+donde el buffer de profundidad sigue en el plano lejano.
+
+**Motivo.** Dibujarlo primero como fondo significa calcular degradado, nubes,
+estrellas y brillo del sol para píxeles que el terreno va a tapar. En un frame
+típico el terreno cubre la mayor parte del panel, así que se descarta la mayoría
+del trabajo sin perder nada.
+
+**Costo medido.** 10.9 ms de 65.6 (16.6 %) con 4 exploradores a `--ssaa 1`. Las
+nubes usan intersección del rayo con un plano horizontal, lo que les da
+perspectiva real; las estrellas salen de un hash de la dirección cuantizada y no
+ocupan memoria.
+
+---
+
 ## Limitaciones conocidas
 
 Documentadas a propósito; están también en el `README.md`.

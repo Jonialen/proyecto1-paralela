@@ -608,7 +608,7 @@ static unsigned face_mask_at(const Chunk *chunk, const ChunkNeighbors *n,
 }
 
 size_t world_emit_view(TriangleBuffer *out, const World *world, Vec3 camera_pos,
-                       float render_radius, Mat4 vp, Vec3 light_dir,
+                       float render_radius, Mat4 vp, const Light *light,
                        const Viewport *view)
 {
     int center_cx = floor_div((int)floorf(camera_pos.x), CHUNK_SIZE_X);
@@ -661,7 +661,7 @@ size_t world_emit_view(TriangleBuffer *out, const World *world, Vec3 camera_pos,
                         Mat4 model = mat4_translate(base_x + (float)x + 0.5f,
                                                     (float)y + 0.5f,
                                                     base_z + (float)z + 0.5f);
-                        emitted += cube_emit(out, block, model, vp, light_dir,
+                        emitted += cube_emit(out, block, model, vp, light,
                                              mask, view);
                     }
                 }

@@ -13,17 +13,18 @@ Vec3 camera_position(const Camera *camera, float t)
         camera->center.z + camera->radius_z * sinf(camera->rate_z * ts + camera->phase_z));
 }
 
-Mat4 camera_view_proj(const Camera *camera, float t, float aspect)
+void camera_basis(const Camera *camera, float t,
+                  Vec3 *eye, Vec3 *forward, Vec3 *right, Vec3 *up)
 {
-    Vec3 eye = camera_position(camera, t);
+    *eye = camera_position(camera, t);
 
     /* Heading comes from the HORIZONTAL travel direction only. Including the
-     * vertical bob here would be wrong: near the top and bottom of the sine the
-     * vertical velocity dominates the horizontal one, and the explorer ends up
-     * staring straight at the sky or the ground instead of ahead. */
+     * vertical bob would be wrong: near the extremes of the sine the vertical
+     * velocity dominates the horizontal one and the explorer ends up staring
+     * straight at the sky or the ground instead of ahead. */
     Vec3 ahead = camera_position(camera, t + 0.08f);
-    float dx = ahead.x - eye.x;
-    float dz = ahead.z - eye.z;
+    float dx = ahead.x - eye->x;
+    float dz = ahead.z - eye->z;
     float len = sqrtf(dx * dx + dz * dz);
     if (len < 1e-6f) {         /* degenerate: path stalled, pick any heading */
         dx = 0.0f; dz = -1.0f; len = 1.0f;
@@ -34,16 +35,24 @@ Mat4 camera_view_proj(const Camera *camera, float t, float aspect)
     /* Pitch is its own gentle oscillation, biased downwards so the terrain
      * stays in frame rather than the empty sky. */
     float ts = t * camera->speed;
-    float pitch = -0.42f + 0.14f * sinf(camera->bob_rate * 0.6f * ts + camera->phase_y);
+    float pitch = -0.30f + 0.13f * sinf(camera->bob_rate * 0.6f * ts + camera->phase_y);
     float cos_pitch = cosf(pitch);
 
-    Vec3 target = vec3_make(eye.x + dx * cos_pitch,
-                            eye.y + sinf(pitch),
-                            eye.z + dz * cos_pitch);
+    *forward = vec3_normalize(vec3_make(dx * cos_pitch, sinf(pitch), dz * cos_pitch));
+    *right = vec3_normalize(vec3_cross(*forward, vec3_make(0.0f, 1.0f, 0.0f)));
+    *up = vec3_cross(*right, *forward);
+}
 
+Mat4 camera_view_proj(const Camera *camera, float t, float aspect)
+{
+    Vec3 eye, forward, right, up;
+    camera_basis(camera, t, &eye, &forward, &right, &up);
+
+    Vec3 target = vec3_make(eye.x + forward.x, eye.y + forward.y, eye.z + forward.z);
     Mat4 view = mat4_look_at(eye, target, vec3_make(0.0f, 1.0f, 0.0f));
-    /* The far plane is this explorer's view distance, so a faster/farther-seeing
-     * explorer genuinely rasterizes more terrain than a slower one. */
+
+    /* The far plane is this explorer's view distance, so a faster or
+     * farther-seeing explorer genuinely rasterizes more terrain. */
     Mat4 proj = mat4_perspective(camera->fov_y_rad, aspect, 0.15f, camera->view_distance);
     return mat4_mul(proj, view);
 }

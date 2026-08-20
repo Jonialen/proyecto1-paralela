@@ -9,12 +9,17 @@
 #include "math3d.h"
 #include "overlay.h"
 #include "render.h"
+#include "sky.h"
 #include "texture.h"
 #include "world.h"
 
 #define PI 3.14159265358979323846f
 #define MAX_PLAYERS 16
 #define BENCH_DT (1.0f / 60.0f) /* fixed step: benchmarks must be reproducible */
+
+/* Where the cycle starts at t = 0. Mid-morning, so a fresh run and every
+ * headless dump open in daylight instead of the middle of the night. */
+#define DAY_PHASE_START 0.28f
 
 enum { SCENE_BLOCK, SCENE_CHUNK };
 
@@ -26,6 +31,7 @@ typedef struct {
     float view_distance;
     float roam;
     long max_chunks;
+    float day_length; /* seconds for a full day/night cycle */
     unsigned seed;
     int block;
     int scene;
@@ -59,7 +65,8 @@ typedef struct {
     int world_count;
     ViewTask *views;
     int view_count;
-    Vec3 light;
+    float day_length;
+    Sky sky;          /* recomputed every frame from the elapsed time */
 } Scene;
 
 static double now_seconds(void)
@@ -119,7 +126,8 @@ static int scene_init(Scene *scene, const Options *opt)
     memset(scene, 0, sizeof(*scene));
     scene->scene = opt->scene;
     scene->block_index = opt->block;
-    scene->light = vec3_normalize(vec3_make(0.45f, 0.8f, 0.6f));
+    scene->day_length = opt->day_length;
+    scene->sky = sky_make(DAY_PHASE_START);
 
     /* One world today. Raising world_count and handing each view a different
      * entry is the whole change needed for independent sub-worlds. */
@@ -163,6 +171,7 @@ typedef struct {
     double stream;   /* generating and evicting chunks */
     double geometry; /* transform, cull, clip, project */
     double raster;   /* per-pixel fill, depth test, texturing */
+    double sky;      /* background: only the pixels terrain left uncovered */
 } FrameTimings;
 
 /* Renders one view. Everything it touches is private to that view or read-only,
@@ -179,20 +188,28 @@ static void render_view(Framebuffer *fb, ViewTask *view, const Scene *scene, flo
         Vec3 eye = camera_position(&view->camera, t);
         view->triangle_count = world_emit_view(&view->triangles, view->world, eye,
                                                view->camera.view_distance, vp,
-                                               scene->light, &view->viewport);
+                                               &scene->sky.light, &view->viewport);
     } else {
         view->triangle_count = cube_emit(&view->triangles, block_get(scene->block_index),
-                                         mat4_identity(), vp, scene->light,
+                                         mat4_identity(), vp, &scene->sky.light,
                                          FACE_ALL, &view->viewport);
     }
 
     double t1 = timings ? now_seconds() : 0.0;
     raster_flush(fb, &view->triangles);
+    double t2 = timings ? now_seconds() : 0.0;
+
+    /* Sky last, so it only fills the pixels the terrain left at the far plane. */
+    Vec3 sky_eye, forward, right, up;
+    camera_basis(&view->camera, t, &sky_eye, &forward, &right, &up);
+    sky_render(fb, &view->viewport, &scene->sky, sky_eye, forward, right, up,
+               tanf(view->camera.fov_y_rad * 0.5f), viewport_aspect(&view->viewport));
 
     if (timings) {
-        double t2 = now_seconds();
+        double t3 = now_seconds();
         timings->geometry += t1 - t0;
         timings->raster += t2 - t1;
+        timings->sky += t3 - t2;
     }
 }
 
@@ -217,10 +234,12 @@ static size_t render_frame(Framebuffer *fb, Scene *scene, float t, FrameTimings 
     if (timings)
         timings->stream += now_seconds() - stream_start;
 
+    /* The cycle advances with the same clock the explorers fly on, so a dump at
+     * a given t always shows the same time of day. */
+    scene->sky = sky_make(DAY_PHASE_START + t / scene->day_length);
+
     /* Phase 2 -- rendering. The world is read-only from here on. */
     framebuffer_clear(fb, 0x0E1622);
-    for (int i = 0; i < scene->view_count; i++)
-        framebuffer_sky(fb, &scene->views[i].viewport, 0x16294A, 0x8FB6D8);
 
     /* >>> The parallel decomposition lives here: this loop over independent
      * views is the one that becomes an OpenMP parallel for. <<< */
@@ -292,9 +311,10 @@ static void draw_hud(uint32_t *pixels, int width, int height, const Scene *scene
 
     char chunks[128];
     const World *world = &scene->worlds[0];
-    snprintf(chunks, sizeof(chunks), "CHUNKS %zu  NEW %zu  DROPPED %zu",
+    float hours = scene->sky.phase * 24.0f;
+    snprintf(chunks, sizeof(chunks), "CHUNKS %zu  NEW %zu  %02d:%02d",
              world_chunk_count(world), world->generated_this_frame,
-             world->evicted_this_frame);
+             (int)hours, (int)((hours - (int)hours) * 60.0f));
     int chunks_w = overlay_text_width(chunks, HUD_SCALE);
 
     int widest = fps_w;
@@ -345,6 +365,7 @@ static void print_usage(const char *prog)
     printf("      --roam N      radius of the flight path, world units (default 320)\n");
     printf("      --max-chunks N  ceiling on resident chunks (default %d)\n", WORLD_DEFAULT_MAX_CHUNKS);
     printf("      --seed N      terrain seed (default 1337)\n");
+    printf("      --daylen N    seconds for a full day/night cycle (default 180)\n");
     printf("      --width N     window width  (default 960, minimum 640)\n");
     printf("      --height N    window height (default 720, minimum 480)\n");
     printf("      --ssaa N      supersampling factor, 1-8 (default 1)\n");
@@ -404,6 +425,9 @@ static int parse_options(int argc, char **argv, Options *opt)
         } else if (!strcmp(flag, "--max-chunks")) {
             if (!parse_int(argv[++i], flag, 64, 200000, &value)) return -1;
             opt->max_chunks = value;
+        } else if (!strcmp(flag, "--daylen")) {
+            if (!parse_int(argv[++i], flag, 4, 100000, &value)) return -1;
+            opt->day_length = (float)value;
         } else if (!strcmp(flag, "--seed")) {
             if (!parse_int(argv[++i], flag, 0, 2147483647L, &value)) return -1;
             opt->seed = (unsigned)value;
@@ -540,7 +564,7 @@ static int run_benchmark(const Options *opt)
         printf("Warmup:     %d frames (untimed)\n", opt->warmup_frames);
 
     size_t last_total = 0;
-    FrameTimings timings = { 0.0, 0.0, 0.0 };
+    FrameTimings timings = { 0.0, 0.0, 0.0, 0.0 };
     double start = now_seconds();
     for (int frame = 0; frame < opt->bench_frames; frame++)
         last_total = render_frame(&fb, &scene,
@@ -562,6 +586,8 @@ static int run_benchmark(const Options *opt)
            timings.geometry * 1000.0 / opt->bench_frames, 100.0 * timings.geometry / elapsed);
     printf("  raster:   %.4f ms  (%.1f%%)\n",
            timings.raster * 1000.0 / opt->bench_frames, 100.0 * timings.raster / elapsed);
+    printf("  sky:      %.4f ms  (%.1f%%)\n",
+           timings.sky * 1000.0 / opt->bench_frames, 100.0 * timings.sky / elapsed);
 
     scene_free(&scene);
     free(resolved);
@@ -744,7 +770,7 @@ static int run_interactive(const Options *opt)
 int main(int argc, char **argv)
 {
     Options opt = { 960, 720, 1, 1, 96.0f, 320.0f, WORLD_DEFAULT_MAX_CHUNKS,
-                    1337u, 0, SCENE_CHUNK, 0, 3, NULL };
+                    180.0f, 1337u, 0, SCENE_CHUNK, 0, 3, NULL };
 
     textures_init();
 

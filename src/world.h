@@ -137,7 +137,7 @@ size_t world_end_frame(World *world);
  * without that, two runs would produce different output and the byte-identical
  * --dump check would be worthless. */
 size_t world_emit_view(TriangleBuffer *out, const World *world, Vec3 camera_pos,
-                       float render_radius, Mat4 vp, Vec3 light_dir,
+                       float render_radius, Mat4 vp, const Light *light,
                        const Viewport *view);
 
 /* Solid blocks across every loaded chunk, for reporting culling savings. */

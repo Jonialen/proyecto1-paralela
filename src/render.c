@@ -88,28 +88,6 @@ void framebuffer_clear(Framebuffer *fb, uint32_t color)
     }
 }
 
-void framebuffer_sky(Framebuffer *fb, const Viewport *view,
-                     uint32_t top, uint32_t horizon)
-{
-    int tr = (int)((top >> 16) & 0xFF), tg = (int)((top >> 8) & 0xFF), tb = (int)(top & 0xFF);
-    int hr = (int)((horizon >> 16) & 0xFF), hg = (int)((horizon >> 8) & 0xFF), hb = (int)(horizon & 0xFF);
-
-    for (int y = 0; y < view->height; y++) {
-        /* Squared ramp keeps most of the pane the deeper colour and compresses
-         * the bright band down near the horizon, which is how a real sky reads. */
-        float t = (float)y / (float)(view->height > 1 ? view->height - 1 : 1);
-        t = t * t;
-        int r = tr + (int)((hr - tr) * t);
-        int g = tg + (int)((hg - tg) * t);
-        int b = tb + (int)((hb - tb) * t);
-        uint32_t color = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
-
-        uint32_t *row = &fb->color[(size_t)(view->y + y) * fb->fb_width + (size_t)view->x];
-        for (int x = 0; x < view->width; x++)
-            row[x] = color;
-    }
-}
-
 void framebuffer_resolve(const Framebuffer *fb, uint32_t *out)
 {
     int s = fb->ssaa;
@@ -271,7 +249,7 @@ static int emit_triangle(TriangleBuffer *out, const Texture *tex, float light,
 }
 
 size_t cube_emit(TriangleBuffer *out, const Block *block, Mat4 model, Mat4 vp,
-                 Vec3 light_dir, unsigned face_mask, const Viewport *view)
+                 const Light *light, unsigned face_mask, const Viewport *view)
 {
     if (!block || (face_mask & FACE_ALL) == 0)
         return 0;
@@ -290,9 +268,10 @@ size_t cube_emit(TriangleBuffer *out, const Block *block, Mat4 model, Mat4 vp,
         Vec4 n4 = { f->normal.x, f->normal.y, f->normal.z, 0.0f };
         Vec4 wn = mat4_mul_vec4(model, n4);
         Vec3 normal = vec3_normalize(vec3_make(wn.x, wn.y, wn.z));
-        float diffuse = vec3_dot(normal, light_dir);
+        float diffuse = vec3_dot(normal, light->direction);
         if (diffuse < 0.0f) diffuse = 0.0f;
-        float light_term = 0.35f + 0.65f * diffuse;
+        float light_term = light->ambient + light->intensity * diffuse;
+        if (light_term > 1.0f) light_term = 1.0f;
 
         ClipVertex quad[4];
         for (int i = 0; i < 4; i++) {
