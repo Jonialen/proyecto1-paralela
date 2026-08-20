@@ -1,0 +1,10 @@
+# Build artifacts -- the rubric asks for source only, no executables
+cubeview
+*.o
+
+# Benchmark and debug output
+*.ppm
+*.png
+
+# Local tooling cache
+.atl/
