@@ -406,7 +406,7 @@ Each frame runs four phases, each **one flat list of tasks**:
 | phase | task | why it is safe |
 |---|---|---|
 | streaming | one missing **chunk** | terrain is a pure function of coordinates |
-| geometry | one chunk **row** of one view | each row fills its own buffer |
+| geometry | one **chunk** of one view | each chunk fills its own buffer |
 | rasterization | one screen **band** of one view | a band owns its rows exclusively |
 | sky | one **slice** of rows of one view | slices write disjoint pixels |
 
@@ -431,63 +431,84 @@ slot. `raster_triangle()` has taken a clip rectangle since the sequential
 version was written, which is why the band split was a few lines rather than a
 rewrite.
 
-Geometry rows are stitched back **in row order**, exactly the order the serial
-scan produces. That is what makes the output independent of how rows were spread
-across threads, and it is why the split is by row rather than by an arbitrary
-partition of the chunks.
+Geometry cells are stitched back **in scan order**, exactly the order the serial
+sweep produces. That is what makes the output independent of how the chunks were
+spread across threads, and it is why the split follows the scan rather than an
+arbitrary partition.
 
-With a single thread the flattening buys nothing and costs the per-row buffers
+The unit was a whole chunk row at first, and rows are wildly uneven: one through
+the middle of the render disk holds a dozen chunks while one at its edge holds
+a single chunk. At one explorer that left thirteen tasks for eight threads and
+geometry ran at 29% efficiency. A single chunk per task took it to 37%.
+
+With a single thread the flattening buys nothing and costs the per-cell buffers
 and the stitching, so that case takes the direct path instead.
 
-#### Speedup fell while the program got faster
+### Speedup (960x720, `--view 96 --ssaa 1`, 8 threads)
 
-Two and four explorers used to show 3.79x and 3.47x; they now show 2.96x and
-2.70x. Nothing regressed. Frustum culling and the cheaper cloud sampling made
-the *sequential* baseline much faster, so the fixed cost of the parallel
-machinery is a larger share of a smaller number.
+| N | sequential | 8 threads | speedup | efficiency | FPS | 30 FPS floor |
+|---|---|---|---|---|---|---|
+| 1  |  19.5 ms |  4.9 ms | 3.96 | 49.6% | **203.2** | met |
+| 2  |  22.5 ms |  5.8 ms | 3.86 | 48.2% | **171.4** | met |
+| 4  |  47.2 ms | 12.5 ms | 3.77 | 47.2% | **80.0** | met |
+| 8  |  85.7 ms | 22.2 ms | 3.86 | 48.3% | **45.1** | met |
+| 16 | 163.8 ms | 40.2 ms | 4.07 | 50.9% | 24.9 | close |
 
-Speedup measures how well work divides, not how fast the program is. Optimizing
-the algorithm lowers it and is still the right thing to do — which is why the
-FPS column is there beside it.
+Efficiency stays within four points across the whole range. Before the tasks
+were flattened it ran from 34% to 54% depending on how the work happened to
+divide by view count, which made the speedup an accident of N rather than a
+property of the decomposition.
 
-#### One word was worth 1.6x
+**The floor is met up to eight explorers.** One explorer went from 20.4 FPS at
+the start of the project to 203.2 — a factor of ten, of which 4.0 is threads and
+the rest is work that stopped being done at all.
 
-The sky loop first used `schedule(static)`, and the sky then scaled at only 2.9x
-while geometry and rasterization reached 5-6x. The reason is visible in the
-scene: rows near the top of a pane are open sky and pay the full three-octave
-cloud lookup, rows near the bottom are covered by terrain and the depth test
-rejects them immediately. A static split hands one thread every expensive row
-and another every cheap one.
+#### Speedup falls when the sequential build gets faster
 
-With `schedule(dynamic, 8)` the sky went from 6.91 ms to 2.69 ms, the frame from
-13.0 ms to 8.1 ms, and one explorer from 77 to 121 FPS.
+Several figures in this section are *lower* than earlier measurements while the
+program is much faster. Nothing regressed. Frustum culling, cheaper cloud
+sampling and stepped edge functions all made the **sequential** baseline faster,
+so the fixed cost of the parallel machinery is a larger share of a smaller
+number.
 
-The lesson generalizes: **an even split of iterations is not an even split of
-work.** Look at what each iteration actually does before choosing a policy.
+Speedup measures how well work divides, not how fast the program is. That is why
+the FPS column sits beside it.
 
 ### Thread scaling (`-n 8`)
 
 | threads | ms | speedup | efficiency |
 |---|---|---|---|
-| 1 | 202.6 | 0.96 | 96.3% |
-| 2 | 116.7 | 1.67 | 83.6% |
-| 4 |  68.1 | 2.87 | 71.7% |
-| 8 |  47.9 | 4.07 | 50.9% |
+| 1 |  85.7 | 1.01 | 100.6% |
+| 2 |  50.4 | 1.71 |  85.5% |
+| 4 |  29.6 | 2.91 |  72.8% |
+| 8 |  22.7 | 3.80 |  47.5% |
 
-Efficiency decays the way it always does. One thread at 0.96 rather than 1.00 is
-the cost of the parallel machinery itself, which is small and real.
+Efficiency decays the way it always does. One thread at 1.01 rather than 1.00
+says the parallel machinery costs nothing measurable when it is not used.
+
+### Where the time goes (`-n 1`)
+
+| stage | sequential | 8 threads | speedup |
+|---|---|---|---|
+| geometry | 3.63 ms | 1.32 ms | 2.75 |
+| rasterization | 6.20 ms | 1.65 ms | 3.76 |
+| sky | 8.63 ms | 1.96 ms | 4.41 |
+
+Streaming does not appear: it is 0.3 ms in steady state. On the **first** frame,
+where the whole visible world is built at once, it is 8 ms at one explorer and
+63 ms at eight — down from 69 and 359 before generation was parallelized.
 
 ### Amdahl, and why the sky mattered
 
-At one explorer the sequential split was geometry 28%, rasterization 30%, sky
-41%. Parallelizing geometry alone caps the speedup at
+Early on, only the geometry stage was split, and at one explorer geometry was
+28% of the frame. That caps the speedup at
 
     1 / (0.72 + 0.28/8) = 1.32x
 
 and the measured figure was 1.24x — 94% of a ceiling that was simply too low.
 The gain came from raising the parallel fraction, not from optimizing what was
-already parallel: with all three stages split, the same configuration reaches
-2.56x.
+already parallel. With all four stages split, the same configuration reaches
+3.96x.
 
 ### Scheduling policy
 
@@ -496,27 +517,24 @@ compiled with `schedule(runtime)`. Default is `dynamic`.
 
 | N | `static` | `dynamic` | dynamic wins by |
 |---|---|---|---|
-| 1  | 11.35 ms |  5.82 ms | **48.7%** |
-| 2  | 13.02 ms |  7.26 ms | 44.3% |
-| 4  | 19.08 ms | 13.95 ms | 26.9% |
-| 8  | 27.10 ms | 23.09 ms | 14.8% |
-| 16 | 44.45 ms | 41.41 ms | 6.8% |
+| 1  | 10.43 ms |  7.27 ms | **30%** |
+| 4  | 17.08 ms | 12.68 ms | 26% |
+| 16 | 43.55 ms | 44.48 ms | -2% |
 
-Dynamic wins everywhere, and its advantage **shrinks** as the explorer count
-grows. That is the opposite of what the same comparison showed before the tasks
-were flattened, and the reversal is instructive: the right policy depends on the
-tasks, not on the program.
+Dynamic wins clearly at low explorer counts and the advantage disappears by
+sixteen. Both ends have the same explanation, and it is about the tasks rather
+than the program.
 
-When a task was a whole view, four views on eight threads gave every thread at
-most one task. There was nothing to rebalance and dynamic only charged its own
-overhead, so static won. Now a task is a chunk row, a screen band or a slice of
-sky, and those vary enormously — a row through the middle of the render disk
-holds a dozen chunks while a row at its edge holds one; a band across the
-horizon covers far more filled pixels than a band of open sky.
+A task is a chunk, a screen band or a slice of sky, and those vary enormously: a
+chunk in the middle of the render disk is full of terrain while one at its edge
+is empty; a band across the horizon covers far more filled pixels than a band of
+open sky. At one explorer a view is cut finely and dynamic has plenty to
+rebalance. At sixteen each view is cut into fewer pieces — the split count comes
+from threads over views — so tasks are coarser and more uniform, and dynamic is
+left charging its overhead for nothing.
 
-The advantage narrows at high N because each view is then cut into fewer pieces
-(the split count is derived from threads over views), so the tasks are coarser
-and more uniform again.
+Before the tasks were flattened this comparison came out the other way round,
+with static winning at low N. Nothing about the program changed; the tasks did.
 
 ### A warning about measurement
 
@@ -550,36 +568,44 @@ Two things this required:
 - Headless dumps do not draw a frame rate. A wall-clock reading differs on every
   run, and a single-frame reading is meaningless anyway.
 
-## Notes for the parallel version
+## What was tried and did not pay
 
-**Views.** The loop over `ViewTask`s is the primary decomposition and is
-race-free by construction. Per-view cost is deliberately uneven — explorers fly
-at different speeds with different view distances — so `schedule(static)` and
-`schedule(dynamic)` are worth measuring rather than assuming.
+Three optimizations were implemented, measured and reverted. They are worth more
+in the report than the ones that worked, because each failed for a reason the
+instruction count did not predict.
 
-**Streaming is a separate phase.** It mutates the shared chunk map, so it cannot
-simply be folded into the render loop. It is also only ~0.2% of a steady-state
-frame, so it is not where the speedup is.
+| attempt | expected | measured |
+|---|---|---|
+| reorder the early-out in `raster_triangle` | skip work on 97% of calls | neutral: 13.28 vs 13.36 ms |
+| bin triangles into the bands they touch | 32x less scanning | rasterization -10%, **frame worse** |
+| SIMD lanes in the inner pixel loop | 1.3-2x on rasterization | **26% slower** |
 
-**Raster, if a single view must be split.** Partition by screen tile, never by
-triangle: two triangles can cover the same pixel and the depth test is a
-read-modify-write of one shared slot. `raster_triangle()` already takes a clip
-rectangle for exactly this, and every `ScreenTriangle` carries a clamped bounding
-box so a tile can reject non-overlapping triangles cheaply.
+- The **reorder** was neutral because reading `min_x` already pulls in the cache
+  line the vertices share; the arithmetic it skipped was free.
+- The **binning** lost because the redundant scan walks the triangle array
+  linearly and stays in cache after the first band, while the counting sort does
+  integer divisions and scattered writes. Real work replaced free work.
+- The **SIMD** lanes lost to divergence. Block faces are small, so a lane holds
+  two or three covered pixels out of eight and the rest still pay the
+  barycentric multiplies. With the edge functions already stepped, rejecting a
+  pixel costs three adds — there was nothing left to save.
 
-**Geometry, if a single view must be split.** Partition by chunk with a private
-`TriangleBuffer` per worker, then concatenate. `tribuf_push()` appends to a
-shared buffer and would race on `count`. Keep the concatenation order fixed or
-the byte-identical `--dump` check stops working.
+What did pay in the same round: making a **chunk** rather than a row the unit of
+geometry work, generating missing chunks in **parallel**, and **stepping** the
+edge functions instead of re-evaluating them. That last one gave 26% off
+rasterization on its own.
+
+The pattern across all six: cheapening the common path beat every attempt to
+skip it, and a rejection that looks expensive by instruction count can be nearly
+free when it streams through cache.
 
 ## Known gaps
 
-- **The 30 FPS floor is not met sequentially** at any measured setting. See
-  above.
-- **The sky is disproportionately expensive**, and at high supersampling it
-  outweighs the rasterizer. The cloud lookup is three octaves of noise per sky
-  pixel; evaluating it at display resolution and upsampling, or caching it per
-  frame, would cut it sharply.
+- **The floor is not met at sixteen explorers** (24.9 FPS) and the sequential
+  build meets it only at one. Both are stated in the tables above.
+- **The sky remains the largest stage** at one explorer even after the cloud
+  lookup was made coarse. Caching it per frame rather than per pixel would cut
+  it further.
 - The first frame still streams the whole visible world at once. Parallel
   generation cut that from 359 ms to 62 ms at eight explorers, but a per-frame
   generation budget would smooth what remains.

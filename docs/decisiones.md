@@ -376,18 +376,112 @@ a dominar. Rango de alturas útil de 5 a 36 en vez de 8 a 19.
 
 ---
 
+## D-19. Dos binarios desde las mismas fuentes
+
+**Decisión.** El `Makefile` produce `cubeview` (con `-fopenmp`) y `cubeview-seq`
+(sin), a partir del mismo árbol de fuentes. Todo `pragma omp` y toda llamada
+`omp_*` está protegida con `#ifdef _OPENMP`.
+
+**Motivo.** La rúbrica pide versión secuencial **y** paralela. Compilar una sola
+y fijar los hilos en 1 no es lo mismo: quedaría la maquinaria de OpenMP presente
+en el binario. Con la guarda, el secuencial es un programa monohilo genuino.
+
+**Detalle.** `--threads` y `--schedule` se aceptan y se ignoran en el build
+secuencial, así la misma línea de comandos sirve para los dos y comparar es
+scriptable.
+
+---
+
+## D-20. Una lista plana de tareas por etapa
+
+**Contexto.** Primero se elegía entre partir por vista o partir dentro de una
+vista, según `view_count >= threads`.
+
+**Decisión.** Cada etapa arma **una sola lista plana** de tareas `(vista, ítem)`:
+un chunk para geometría, una banda de pantalla para rasterizado, una rebanada de
+filas para el cielo.
+
+**Motivo.** Elegir un nivel u otro hacía que el speedup fuera un **accidente de
+N**: la eficiencia iba de 34 % a 54 % según cómo cayera la división. Partir solo
+por vista da tareas gruesas —con dieciséis vistas y un desbalance de 6× la más
+pesada define el frame— y partir dentro de una vista por vez paga la entrada a
+una región paralela una vez por vista y por etapa.
+
+**Consecuencia.** Eficiencia dentro de cuatro puntos en todo el rango. Cuán fino
+se corta cada vista se deriva de la cantidad de hilos, así el total cae siempre
+cerca de cuatro tareas por hilo.
+
+**Error cometido.** La primera versión hacía pasar también al build secuencial
+por los buffers por celda y la costura. Eso lo volvió 20 % más lento e **infló
+el speedup a 4.47×**. Es el tipo de error que halaga: un número que sube porque
+empeoró el denominador. De ahí que las tablas lleven siempre las tres columnas
+—secuencial, paralelo y FPS— y no solo el speedup.
+
+---
+
+## D-21. Rasterizado por bandas de pantalla, nunca por triángulo
+
+**Decisión.** El rasterizado paralelo parte la pantalla en bandas horizontales;
+cada banda es dueña exclusiva de sus filas.
+
+**Motivo.** Dos triángulos pueden cubrir el mismo píxel, y la prueba de
+profundidad es una lectura-modificación-escritura de ese único slot compartido.
+Repartir por triángulo es una carrera, y de las peores: la imagen sale *casi*
+bien, así que se lee como un artefacto de redondeo y no como un error.
+
+**Lo que lo hizo barato.** `raster_triangle()` recibe un rectángulo de recorte
+desde la versión secuencial, agregado precisamente para esto. La división por
+bandas fueron unas pocas líneas en vez de una reescritura.
+
+---
+
+## D-22. Tres optimizaciones medidas y descartadas
+
+**Decisión.** Se implementaron, se midieron y se revirtieron. Quedan documentadas
+en `AGENTS.md` para que nadie las reintente.
+
+| intento | esperado | medido |
+|---|---|---|
+| reordenar el corte temprano de `raster_triangle` | saltear el 97 % de las llamadas | neutral: 13.28 vs 13.36 ms |
+| *binning* de triángulos por banda | 32× menos escaneo | raster −10 %, **frame peor** |
+| SIMD por lanes en el bucle de píxeles | 1.3–2× en rasterizado | **26 % más lento** |
+
+**Por qué fallaron.**
+
+- El **reorden** fue neutral porque leer `min_x` ya trae la línea de caché que
+  comparten los vértices: la aritmética que salteaba ya era gratis.
+- El **binning** perdió porque el escaneo redundante recorre el arreglo de
+  triángulos de forma lineal y queda en caché después de la primera banda,
+  mientras que el ordenamiento por conteo hace divisiones enteras y escrituras
+  dispersas. Reemplazó trabajo gratis por trabajo real.
+- El **SIMD** perdió por divergencia. Las caras de bloque son chicas: un lane
+  típico tiene dos o tres píxeles cubiertos de ocho, y los otros pagan igual las
+  multiplicaciones baricéntricas. Con las aristas ya incrementales, rechazar un
+  píxel cuesta tres sumas — no quedaba nada que ahorrar.
+
+**Nota metodológica.** La conclusión inicial sobre SIMD fue *inválida*: se midió
+que `-O3 -march=native` no mejoraba y se dedujo que SIMD no serviría. Al
+verificar con `-fopt-info-vec-optimized` resultó que el compilador **nunca
+vectorizó el bucle interno** —lo dice él mismo: *unsupported control flow*—, así
+que esa medición no decía nada sobre SIMD escrito a mano. La premisa no sostenía
+la conclusión.
+
+**El patrón de los seis intentos.** Abaratar el camino común le ganó a todos los
+intentos de saltearlo. Y un rechazo que parece caro por conteo de instrucciones
+puede ser casi gratis cuando recorre memoria en streaming.
+
+---
+
 ## Limitaciones conocidas
 
 Documentadas a propósito; están también en el `README.md`.
 
-- **El piso de 30 FPS no se cumple en la versión secuencial** en ninguna
-  configuración medida: 20.4 FPS con un explorador, 1.8 con dieciséis.
-  Recuperarlo es el objetivo de la versión paralela, pero con 8 núcleos hay que
-  aceptar la aritmética: 1.5x es cómodo con N = 1 y 17x es imposible con N = 16.
-- **El cielo es desproporcionadamente caro.** A `--ssaa 4` cuesta más que el
-  rasterizador (284.9 ms contra 266.7). La consulta de nubes son tres octavas de
-  ruido por píxel de cielo y el supermuestreo las multiplica por 16. Evaluarlo a
-  resolución de pantalla y ampliar, o cachearlo por frame, lo cortaría mucho.
+- **El piso de 30 FPS se cumple hasta ocho exploradores** en la versión
+  paralela; con dieciséis quedan 24.9 FPS. La versión secuencial solo lo cumple
+  con un explorador.
+- **El cielo sigue siendo la etapa más cara** con un explorador, aun después de
+  volver gruesa la consulta de nubes. Cachearla por frame en vez de por píxel la
+  cortaría más.
 - Los primeros frames generan miles de chunks y producen un tirón visible. Un
   presupuesto de generación por frame lo suavizaría.
 - No hay descarte por *frustum* de chunks: se recorre el disco completo alrededor
