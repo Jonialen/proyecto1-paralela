@@ -245,12 +245,26 @@ static void render_view(Framebuffer *fb, ViewTask *view, const Scene *scene, flo
 
     double t0 = measure ? now_seconds() : 0.0;
 
+    /* The camera basis is needed twice: once to reject chunks outside the view,
+     * once to reconstruct sky rays. Computed here so it is derived once. */
+    Vec3 eye, forward, right, up;
+    camera_basis(&view->camera, t, &eye, &forward, &right, &up);
+
     tribuf_clear(&view->triangles);
     if (scene->scene == SCENE_CHUNK) {
-        Vec3 eye = camera_position(&view->camera, t);
+        float aspect = viewport_aspect(&view->viewport);
+        float tan_half_v = tanf(view->camera.fov_y_rad * 0.5f);
+
+        ViewFrustum frustum;
+        frustum.eye = eye;
+        frustum.forward = forward;
+        frustum.right = right;
+        frustum.tan_half_h = tan_half_v * aspect;
+
         view->triangle_count = world_emit_view(&view->triangles, view->world, eye,
                                                view->camera.view_distance, vp,
                                                &scene->sky.light, &view->viewport,
+                                               &frustum,
                                                parallel_chunks ? view->rows : NULL,
                                                parallel_chunks ? view->row_capacity : 0);
     } else {
@@ -265,9 +279,7 @@ static void render_view(Framebuffer *fb, ViewTask *view, const Scene *scene, flo
     double t2 = measure ? now_seconds() : 0.0;
 
     /* Sky last, so it only fills the pixels the terrain left at the far plane. */
-    Vec3 sky_eye, forward, right, up;
-    camera_basis(&view->camera, t, &sky_eye, &forward, &right, &up);
-    sky_render(fb, &view->viewport, &scene->sky, sky_eye, forward, right, up,
+    sky_render(fb, &view->viewport, &scene->sky, eye, forward, right, up,
                tanf(view->camera.fov_y_rad * 0.5f), viewport_aspect(&view->viewport),
                parallel_chunks);
 

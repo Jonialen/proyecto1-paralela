@@ -136,6 +136,19 @@ size_t world_end_frame(World *world);
  * the triangle order does not depend on which chunks happened to load first --
  * without that, two runs would produce different output and the byte-identical
  * --dump check would be worthless. */
+/* Camera wedge used to reject chunks the view cannot possibly contain.
+ *
+ * A point is inside the horizontal extent when |dot(d, right)| <= tan_half * 
+ * dot(d, forward), with d measured from the eye. Expressed against the camera's
+ * own axes it stays correct however the camera is pitched, which a test on
+ * world-space angles would not. */
+typedef struct {
+    Vec3 eye;
+    Vec3 forward;
+    Vec3 right;
+    float tan_half_h;  /* tangent of the horizontal half field of view */
+} ViewFrustum;
+
 /* Rows of chunks a view can span at the largest supported render distance.
  * world_emit_view() parallelizes over rows, one scratch buffer each. */
 #define WORLD_MAX_CHUNK_ROWS 320
@@ -147,7 +160,7 @@ size_t world_end_frame(World *world);
  * Pass NULL to force the serial path. */
 size_t world_emit_view(TriangleBuffer *out, const World *world, Vec3 camera_pos,
                        float render_radius, Mat4 vp, const Light *light,
-                       const Viewport *view,
+                       const Viewport *view, const ViewFrustum *frustum,
                        TriangleBuffer *rows, int row_capacity);
 
 /* Solid blocks across every loaded chunk, for reporting culling savings. */

@@ -687,12 +687,47 @@ static uint32_t neighbourhood_mask(const Chunk *chunk, const ChunkNeighbors *n,
     return mask;
 }
 
+/* True when the chunk cannot appear in the view at all.
+ *
+ * The chunk is bounded by a sphere sized from its own occupied height rather
+ * than the full 64 blocks, which keeps the test tight enough to be worth
+ * running: a chunk holding only 20 blocks of terrain gets a far smaller sphere
+ * than the chunk struct's nominal extent would suggest.
+ *
+ * Conservative on purpose. A chunk is dropped only when the whole sphere lies
+ * beyond one side plane, so the test never removes anything visible. */
+static int chunk_outside_frustum(const ViewFrustum *frustum, const Chunk *chunk,
+                                 float base_x, float base_z)
+{
+    float half_y = (float)chunk->height_limit * 0.5f;
+    float dx = base_x + CHUNK_SIZE_X * 0.5f - frustum->eye.x;
+    float dy = half_y - frustum->eye.y;
+    float dz = base_z + CHUNK_SIZE_Z * 0.5f - frustum->eye.z;
+
+    float radius = sqrtf((float)(CHUNK_SIZE_X * CHUNK_SIZE_X) * 0.25f +
+                         half_y * half_y +
+                         (float)(CHUNK_SIZE_Z * CHUNK_SIZE_Z) * 0.25f);
+
+    float f = dx * frustum->forward.x + dy * frustum->forward.y + dz * frustum->forward.z;
+    float r = dx * frustum->right.x + dy * frustum->right.y + dz * frustum->right.z;
+
+    float tan_half = frustum->tan_half_h;
+    float scale = 1.0f / sqrtf(1.0f + tan_half * tan_half);
+
+    /* Signed distance to each side plane, positive on the outside. */
+    if ((r - tan_half * f) * scale > radius)
+        return 1;
+    if ((-r - tan_half * f) * scale > radius)
+        return 1;
+    return 0;
+}
+
 /* Emits one row of chunks. Split out so the row loop can run either serially or
  * in parallel without duplicating the body. */
 static size_t emit_chunk_row(TriangleBuffer *out, const World *world, int cz,
                              int center_cx, int reach, Vec3 camera_pos,
                              float radius_sq, Mat4 vp, const Light *light,
-                             const Viewport *view)
+                             const Viewport *view, const ViewFrustum *frustum)
 {
     size_t emitted = 0;
 
@@ -706,15 +741,18 @@ static size_t emit_chunk_row(TriangleBuffer *out, const World *world, int cz,
         if (!chunk)
             continue;
 
+        float base_x = (float)cx * CHUNK_SIZE_X;
+        float base_z = (float)cz * CHUNK_SIZE_Z;
+
+        if (frustum && chunk_outside_frustum(frustum, chunk, base_x, base_z))
+            continue;
+
         ChunkNeighbors neighbors = {
             world_find_chunk(world, cx - 1, cz),
             world_find_chunk(world, cx + 1, cz),
             world_find_chunk(world, cx, cz - 1),
             world_find_chunk(world, cx, cz + 1)
         };
-
-        float base_x = (float)cx * CHUNK_SIZE_X;
-        float base_z = (float)cz * CHUNK_SIZE_Z;
 
         int y_limit = (int)chunk->height_limit;
         for (int y = 0; y < y_limit; y++) {
@@ -752,7 +790,7 @@ static size_t emit_chunk_row(TriangleBuffer *out, const World *world, int cz,
 
 size_t world_emit_view(TriangleBuffer *out, const World *world, Vec3 camera_pos,
                        float render_radius, Mat4 vp, const Light *light,
-                       const Viewport *view,
+                       const Viewport *view, const ViewFrustum *frustum,
                        TriangleBuffer *rows, int row_capacity)
 {
     int center_cx = floor_div((int)floorf(camera_pos.x), CHUNK_SIZE_X);
@@ -767,7 +805,7 @@ size_t world_emit_view(TriangleBuffer *out, const World *world, Vec3 camera_pos,
         for (int r = 0; r < row_count; r++)
             emitted += emit_chunk_row(out, world, center_cz - reach + r,
                                       center_cx, reach, camera_pos, radius_sq,
-                                      vp, light, view);
+                                      vp, light, view, frustum);
         return emitted;
     }
 
@@ -784,7 +822,7 @@ size_t world_emit_view(TriangleBuffer *out, const World *world, Vec3 camera_pos,
         tribuf_clear(&rows[r]);
         emitted += emit_chunk_row(&rows[r], world, center_cz - reach + r,
                                   center_cx, reach, camera_pos, radius_sq,
-                                  vp, light, view);
+                                  vp, light, view, frustum);
     }
 
     for (int r = 0; r < row_count; r++)
