@@ -157,13 +157,17 @@ typedef struct {
  * it to build a flat task list across several views. */
 int world_row_count(float render_radius);
 
-/* Emits one chunk row, addressed by index rather than by chunk coordinate.
- * Rows are independent, so a caller can run any set of (view, row) pairs
- * concurrently as long as each writes its own buffer. */
-size_t world_emit_row(TriangleBuffer *out, const World *world, Vec3 camera_pos,
-                      float render_radius, Mat4 vp, const Light *light,
-                      const Viewport *view, const ViewFrustum *frustum,
-                      int row_index);
+/* Emits ONE chunk, addressed by its (row, column) index inside the render
+ * square rather than by chunk coordinate.
+ *
+ * The unit of parallel work is a single chunk and not a whole row, because rows
+ * are wildly uneven: a row through the middle of the render disk holds a dozen
+ * chunks while a row at its edge holds one, and at a single explorer there are
+ * only about thirteen rows to spread over eight threads. */
+size_t world_emit_chunk(TriangleBuffer *out, const World *world, Vec3 camera_pos,
+                        float render_radius, Mat4 vp, const Light *light,
+                        const Viewport *view, const ViewFrustum *frustum,
+                        int row_index, int col_index);
 
 /* `rows` is optional scratch, one TriangleBuffer per chunk row. When it is
  * supplied and large enough, the geometry stage runs the rows in parallel and

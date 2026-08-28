@@ -75,8 +75,10 @@ typedef struct {
     /* Scratch for the row-parallel geometry pass, one buffer per chunk row.
      * Owned by the view and reused every frame so the parallel path costs no
      * allocations after the first. */
-    TriangleBuffer *rows;
-    int row_capacity;
+    /* One buffer per chunk cell of the render square, so a task can be a single
+     * chunk. Indexed row * row_count + column. */
+    TriangleBuffer *cells;
+    int cell_capacity;
 
     /* Per-frame camera state, derived once in the setup pass so every task that
      * touches this view reads it instead of recomputing it. */
@@ -162,9 +164,9 @@ static void scene_free(Scene *scene)
     if (scene->views) {
         for (int i = 0; i < scene->view_count; i++) {
             tribuf_free(&scene->views[i].triangles);
-            for (int r = 0; r < scene->views[i].row_capacity; r++)
-                tribuf_free(&scene->views[i].rows[r]);
-            free(scene->views[i].rows);
+            for (int c = 0; c < scene->views[i].cell_capacity; c++)
+                tribuf_free(&scene->views[i].cells[c]);
+            free(scene->views[i].cells);
         }
         free(scene->views);
         scene->views = NULL;
@@ -240,20 +242,21 @@ static int scene_init(Scene *scene, const Options *opt)
         scene->views[i].world = &scene->worlds[0];
         tribuf_init(&scene->views[i].triangles);
 
-        /* One scratch buffer per chunk row this explorer can reach. */
+        /* One scratch buffer per chunk cell this explorer can reach. */
         int reach = (int)ceilf(scene->views[i].camera.view_distance / (float)CHUNK_SIZE_X);
         int rows = 2 * reach + 1;
         if (rows > WORLD_MAX_CHUNK_ROWS)
             rows = WORLD_MAX_CHUNK_ROWS;
-        scene->views[i].rows = calloc((size_t)rows, sizeof(TriangleBuffer));
-        if (!scene->views[i].rows) {
+        int cells = rows * rows;
+        scene->views[i].cells = calloc((size_t)cells, sizeof(TriangleBuffer));
+        if (!scene->views[i].cells) {
             fprintf(stderr, "Error: out of memory allocating geometry scratch\n");
             scene_free(scene);
             return 0;
         }
-        scene->views[i].row_capacity = rows;
-        for (int r = 0; r < rows; r++)
-            tribuf_init(&scene->views[i].rows[r]);
+        scene->views[i].cell_capacity = cells;
+        for (int c = 0; c < cells; c++)
+            tribuf_init(&scene->views[i].cells[c]);
     }
     return 1;
 }
@@ -299,8 +302,7 @@ static void render_view(Framebuffer *fb, ViewTask *view, const Scene *scene, flo
                                                view->camera.view_distance, vp,
                                                &scene->sky.light, &view->viewport,
                                                &frustum,
-                                               parallel_chunks ? view->rows : NULL,
-                                               parallel_chunks ? view->row_capacity : 0);
+                                               NULL, 0);
     } else {
         view->triangle_count = cube_emit(&view->triangles, block_get(scene->block_index),
                                          mat4_identity(), vp, &scene->sky.light,
@@ -352,8 +354,8 @@ static void view_prepare(ViewTask *view, const Scene *scene, float t)
     view->frustum.tan_half_h = tanf(view->camera.fov_y_rad * 0.5f) * aspect;
 
     view->row_count = world_row_count(view->camera.view_distance);
-    if (view->row_count > view->row_capacity)
-        view->row_count = view->row_capacity;
+    while (view->row_count * view->row_count > view->cell_capacity)
+        view->row_count--;
 
     (void)scene;
 }
@@ -434,17 +436,19 @@ static size_t render_frame(Framebuffer *fb, Scene *scene, float t, FrameTimings 
     /* ---- Phase 2: geometry, one task per (view, chunk row) ---- */
     int count = 0;
     for (int v = 0; v < scene->view_count; v++)
-        count += scene->views[v].row_count;
+        count += scene->views[v].row_count * scene->views[v].row_count;
     if (!scene_reserve_tasks(scene, count))
         return 0;
 
     int n = 0;
-    for (int v = 0; v < scene->view_count; v++)
-        for (int r = 0; r < scene->views[v].row_count; r++) {
+    for (int v = 0; v < scene->view_count; v++) {
+        int cells = scene->views[v].row_count * scene->views[v].row_count;
+        for (int c = 0; c < cells; c++) {
             scene->tasks[n].view = v;
-            scene->tasks[n].item = r;
+            scene->tasks[n].item = c;
             n++;
         }
+    }
 
     double t0 = timings ? now_seconds() : 0.0;
     /* schedule(runtime) on the three measured stages, so --schedule selects the
@@ -454,11 +458,12 @@ static size_t render_frame(Framebuffer *fb, Scene *scene, float t, FrameTimings 
 #endif
     for (int i = 0; i < n; i++) {
         ViewTask *view = &scene->views[scene->tasks[i].view];
-        int row = scene->tasks[i].item;
-        tribuf_clear(&view->rows[row]);
-        world_emit_row(&view->rows[row], view->world, view->eye,
-                       view->camera.view_distance, view->vp,
-                       &scene->sky.light, &view->viewport, &view->frustum, row);
+        int cell = scene->tasks[i].item;
+        tribuf_clear(&view->cells[cell]);
+        world_emit_chunk(&view->cells[cell], view->world, view->eye,
+                         view->camera.view_distance, view->vp,
+                         &scene->sky.light, &view->viewport, &view->frustum,
+                         cell / view->row_count, cell % view->row_count);
     }
 
     /* Stitching, in row order within each view: exactly the order the serial
@@ -470,8 +475,9 @@ static size_t render_frame(Framebuffer *fb, Scene *scene, float t, FrameTimings 
     for (int v = 0; v < scene->view_count; v++) {
         ViewTask *view = &scene->views[v];
         tribuf_clear(&view->triangles);
-        for (int r = 0; r < view->row_count; r++)
-            tribuf_append(&view->triangles, &view->rows[r]);
+        int cells = view->row_count * view->row_count;
+        for (int c = 0; c < cells; c++)
+            tribuf_append(&view->triangles, &view->cells[c]);
         view->triangle_count = view->triangles.count;
     }
     double t1 = timings ? now_seconds() : 0.0;

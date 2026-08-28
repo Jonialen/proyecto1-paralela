@@ -722,69 +722,76 @@ static int chunk_outside_frustum(const ViewFrustum *frustum, const Chunk *chunk,
     return 0;
 }
 
-/* Emits one row of chunks. Split out so the row loop can run either serially or
- * in parallel without duplicating the body. */
+/* Emits one chunk. The smallest independent unit of geometry work. */
+static size_t emit_one_chunk(TriangleBuffer *out, const World *world,
+                             int cx, int cz, Vec3 camera_pos, float radius_sq,
+                             Mat4 vp, const Light *light, const Viewport *view,
+                             const ViewFrustum *frustum)
+{
+    float ox = ((float)cx + 0.5f) * CHUNK_SIZE_X - camera_pos.x;
+    float oz = ((float)cz + 0.5f) * CHUNK_SIZE_Z - camera_pos.z;
+    if (ox * ox + oz * oz > radius_sq)
+        return 0;
+
+    const Chunk *chunk = world_find_chunk(world, cx, cz);
+    if (!chunk)
+        return 0;
+
+    float base_x = (float)cx * CHUNK_SIZE_X;
+    float base_z = (float)cz * CHUNK_SIZE_Z;
+
+    if (frustum && chunk_outside_frustum(frustum, chunk, base_x, base_z))
+        return 0;
+
+    ChunkNeighbors neighbors = {
+        world_find_chunk(world, cx - 1, cz),
+        world_find_chunk(world, cx + 1, cz),
+        world_find_chunk(world, cx, cz - 1),
+        world_find_chunk(world, cx, cz + 1)
+    };
+
+    size_t emitted = 0;
+    int y_limit = (int)chunk->height_limit;
+    for (int y = 0; y < y_limit; y++) {
+        for (int z = 0; z < CHUNK_SIZE_Z; z++) {
+            for (int x = 0; x < CHUNK_SIZE_X; x++) {
+                uint8_t id = chunk->blocks[chunk_index(x, y, z)];
+                if (id == BLOCK_AIR)
+                    continue;
+
+                unsigned mask = face_mask_at(chunk, &neighbors, x, y, z);
+                if (mask == 0)
+                    continue; /* fully buried */
+
+                const Block *block = block_from_id(id);
+                if (!block)
+                    continue;
+
+                /* Ambient occlusion needs the diagonals, which the six-way face
+                 * mask never looks at. Only built for blocks that show a face. */
+                uint32_t occlusion = neighbourhood_mask(chunk, &neighbors, x, y, z);
+
+                Mat4 model = mat4_translate(base_x + (float)x + 0.5f,
+                                            (float)y + 0.5f,
+                                            base_z + (float)z + 0.5f);
+                emitted += cube_emit(out, block, model, vp, light,
+                                     mask, occlusion, view);
+            }
+        }
+    }
+    return emitted;
+}
+
+/* Emits one row of chunks, for the serial path. */
 static size_t emit_chunk_row(TriangleBuffer *out, const World *world, int cz,
                              int center_cx, int reach, Vec3 camera_pos,
                              float radius_sq, Mat4 vp, const Light *light,
                              const Viewport *view, const ViewFrustum *frustum)
 {
     size_t emitted = 0;
-
-    for (int cx = center_cx - reach; cx <= center_cx + reach; cx++) {
-        float ox = ((float)cx + 0.5f) * CHUNK_SIZE_X - camera_pos.x;
-        float oz = ((float)cz + 0.5f) * CHUNK_SIZE_Z - camera_pos.z;
-        if (ox * ox + oz * oz > radius_sq)
-            continue;
-
-        const Chunk *chunk = world_find_chunk(world, cx, cz);
-        if (!chunk)
-            continue;
-
-        float base_x = (float)cx * CHUNK_SIZE_X;
-        float base_z = (float)cz * CHUNK_SIZE_Z;
-
-        if (frustum && chunk_outside_frustum(frustum, chunk, base_x, base_z))
-            continue;
-
-        ChunkNeighbors neighbors = {
-            world_find_chunk(world, cx - 1, cz),
-            world_find_chunk(world, cx + 1, cz),
-            world_find_chunk(world, cx, cz - 1),
-            world_find_chunk(world, cx, cz + 1)
-        };
-
-        int y_limit = (int)chunk->height_limit;
-        for (int y = 0; y < y_limit; y++) {
-            for (int z = 0; z < CHUNK_SIZE_Z; z++) {
-                for (int x = 0; x < CHUNK_SIZE_X; x++) {
-                    uint8_t id = chunk->blocks[chunk_index(x, y, z)];
-                    if (id == BLOCK_AIR)
-                        continue;
-
-                    unsigned mask = face_mask_at(chunk, &neighbors, x, y, z);
-                    if (mask == 0)
-                        continue; /* fully buried */
-
-                    const Block *block = block_from_id(id);
-                    if (!block)
-                        continue;
-
-                    /* Ambient occlusion needs the diagonals, which the six-way
-                     * face mask never looks at. Only built for blocks that
-                     * actually show a face. */
-                    uint32_t occlusion = neighbourhood_mask(chunk, &neighbors, x, y, z);
-
-                    Mat4 model = mat4_translate(base_x + (float)x + 0.5f,
-                                                (float)y + 0.5f,
-                                                base_z + (float)z + 0.5f);
-                    emitted += cube_emit(out, block, model, vp, light,
-                                         mask, occlusion, view);
-                }
-            }
-        }
-    }
-
+    for (int cx = center_cx - reach; cx <= center_cx + reach; cx++)
+        emitted += emit_one_chunk(out, world, cx, cz, camera_pos, radius_sq,
+                                  vp, light, view, frustum);
     return emitted;
 }
 
@@ -794,18 +801,19 @@ int world_row_count(float render_radius)
     return 2 * reach + 1;
 }
 
-size_t world_emit_row(TriangleBuffer *out, const World *world, Vec3 camera_pos,
-                      float render_radius, Mat4 vp, const Light *light,
-                      const Viewport *view, const ViewFrustum *frustum,
-                      int row_index)
+size_t world_emit_chunk(TriangleBuffer *out, const World *world, Vec3 camera_pos,
+                        float render_radius, Mat4 vp, const Light *light,
+                        const Viewport *view, const ViewFrustum *frustum,
+                        int row_index, int col_index)
 {
     int center_cx = floor_div((int)floorf(camera_pos.x), CHUNK_SIZE_X);
     int center_cz = floor_div((int)floorf(camera_pos.z), CHUNK_SIZE_Z);
     int reach = (int)ceilf(render_radius / (float)CHUNK_SIZE_X);
 
-    return emit_chunk_row(out, world, center_cz - reach + row_index,
-                          center_cx, reach, camera_pos,
-                          render_radius * render_radius,
+    return emit_one_chunk(out, world,
+                          center_cx - reach + col_index,
+                          center_cz - reach + row_index,
+                          camera_pos, render_radius * render_radius,
                           vp, light, view, frustum);
 }
 
