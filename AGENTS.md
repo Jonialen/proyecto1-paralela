@@ -162,9 +162,23 @@ Recorded so they are not attempted again. Both were measured, not guessed.
   stays in cache after the first band; the sort does integer divisions and
   scattered writes, which is real work. Reverted.
 
-The lesson both share: a rejection that looks expensive by instruction count can
-be nearly free when it streams through cache, while the bookkeeping meant to
-avoid it is not.
+- **SIMD lanes in the rasterizer inner loop.** Coverage and the depth test are
+  data-dependent branches no auto-vectorizer will cross, so they were resolved
+  into a mask and the interpolation run unconditionally over eight-pixel lanes.
+  Rasterization got **26% slower** at one explorer. Divergence is why: block
+  faces are small, so most lanes hold two or three covered pixels out of eight,
+  and every uncovered lane still pays three barycentric multiplies and a depth
+  interpolation. With the edge functions already stepped, rejecting a pixel
+  costs three adds and a compare -- there was nothing left to save. Reverted.
+
+The lesson all three share: a rejection that looks expensive by instruction
+count can be nearly free, while the machinery built to avoid it is not. Measure
+the rejection before optimizing it away.
+
+Note also that these were tried *after* the edge functions were stepped
+incrementally, which is the one rasterizer optimization that did pay: 26% off
+rasterization and 19% off the frame. Cheapening the common path beat every
+attempt to skip it.
 
 ## Parallelization notes
 
