@@ -401,15 +401,22 @@ the same command line drives both and comparisons are easy to script.
 
 ### One flat task list per stage
 
-Each frame runs four phases. The first mutates the shared chunk map and stays
-serial; the other three are each **one flat list of (view, item) tasks**:
+Each frame runs four phases, each **one flat list of tasks**:
 
 | phase | task | why it is safe |
 |---|---|---|
-| streaming | — | serial: it mutates the chunk map |
+| streaming | one missing **chunk** | terrain is a pure function of coordinates |
 | geometry | one chunk **row** of one view | each row fills its own buffer |
 | rasterization | one screen **band** of one view | a band owns its rows exclusively |
 | sky | one **slice** of rows of one view | slices write disjoint pixels |
+
+Streaming runs in three passes: a serial walk of the disk that keeps live chunks
+alive and lists the missing ones, a parallel pass that builds them, and a serial
+pass that publishes them. Only generation is parallel, and it is the part that
+costs — terrain is a pure function of world coordinates and the seed, so chunks
+can be built in any order on any thread. Insertion follows the disk scan, so it
+does not depend on which thread finished first. That took the first frame from
+359 ms to 62 ms at eight explorers while leaving steady state at 0.3 ms.
 
 Flattening is what keeps efficiency flat. Splitting by view alone gives coarse
 tasks — sixteen views with a 6x cost spread means the heaviest view sets the
@@ -573,8 +580,9 @@ the byte-identical `--dump` check stops working.
   outweighs the rasterizer. The cloud lookup is three octaves of noise per sky
   pixel; evaluating it at display resolution and upsampling, or caching it per
   frame, would cut it sharply.
-- The first frames stream thousands of chunks at once and stall visibly. A
-  per-frame generation budget would smooth it.
+- The first frame still streams the whole visible world at once. Parallel
+  generation cut that from 359 ms to 62 ms at eight explorers, but a per-frame
+  generation budget would smooth what remains.
 - No frustum culling of chunks: the full disk around each camera is walked, even
   the part behind it.
 - No distance fog, so the edge of the render distance is a hard horizon.

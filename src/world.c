@@ -371,6 +371,10 @@ int world_init(World *world, const TerrainParams *params, size_t max_chunks)
 
 void world_free(World *world)
 {
+    free(world->pending);
+    world->pending = NULL;
+    world->pending_capacity = 0;
+
     if (world->slots) {
         for (size_t i = 0; i < world->capacity; i++)
             if (world->slots[i].state == CHUNK_SLOT_USED)
@@ -493,6 +497,22 @@ void world_begin_frame(World *world)
     world->evicted_this_frame = 0;
 }
 
+/* Grows the pending list. Reused every frame, so this allocates once. */
+static int world_reserve_pending(World *world, size_t needed)
+{
+    if (needed <= world->pending_capacity)
+        return 1;
+    size_t next = world->pending_capacity ? world->pending_capacity : 256;
+    while (next < needed)
+        next *= 2;
+    PendingChunk *grown = realloc(world->pending, next * sizeof(PendingChunk));
+    if (!grown)
+        return 0;
+    world->pending = grown;
+    world->pending_capacity = next;
+    return 1;
+}
+
 size_t world_stream_around(World *world, Vec3 center, float generate_radius)
 {
     if (generate_radius <= 0.0f)
@@ -503,7 +523,9 @@ size_t world_stream_around(World *world, Vec3 center, float generate_radius)
     int reach = (int)ceilf(generate_radius / (float)CHUNK_SIZE_X);
     float radius_sq = generate_radius * generate_radius;
 
-    size_t generated = 0;
+    /* Pass 1, serial: walk the disk, keep what already exists alive, and list
+     * what is missing. Touches the shared map, so it cannot be parallel. */
+    size_t pending_count = 0;
     for (int dz = -reach; dz <= reach; dz++) {
         for (int dx = -reach; dx <= reach; dx++) {
             int cx = center_cx + dx;
@@ -522,17 +544,46 @@ size_t world_stream_around(World *world, Vec3 center, float generate_radius)
                 continue;
             }
 
-            Chunk *chunk = malloc(sizeof(Chunk));
-            if (!chunk)
-                return generated; /* out of memory: stop growing, keep running */
-
-            chunk_generate(chunk, &world->params, cx, cz);
-            if (!world_insert(world, cx, cz, chunk)) {
-                free(chunk);
-                return generated;
-            }
-            generated++;
+            if (!world_reserve_pending(world, pending_count + 1))
+                break; /* out of memory: build what was listed and carry on */
+            world->pending[pending_count].cx = cx;
+            world->pending[pending_count].cz = cz;
+            world->pending[pending_count].chunk = NULL;
+            pending_count++;
         }
+    }
+
+    if (pending_count == 0)
+        return 0;
+
+    /* Pass 2, parallel: terrain is a pure function of world coordinates and the
+     * seed, so chunks can be built in any order, on any thread, with nothing
+     * shared between them. This is where the time goes -- hundreds of
+     * milliseconds on the first frame, when the whole visible world appears at
+     * once. */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+    for (long i = 0; i < (long)pending_count; i++) {
+        Chunk *chunk = malloc(sizeof(Chunk));
+        if (chunk)
+            chunk_generate(chunk, &world->params,
+                           world->pending[i].cx, world->pending[i].cz);
+        world->pending[i].chunk = chunk;
+    }
+
+    /* Pass 3, serial: publish them. Insertion order follows the disk scan, so
+     * it does not depend on which thread finished first. */
+    size_t generated = 0;
+    for (size_t i = 0; i < pending_count; i++) {
+        Chunk *chunk = world->pending[i].chunk;
+        if (!chunk)
+            continue;
+        if (!world_insert(world, world->pending[i].cx, world->pending[i].cz, chunk)) {
+            free(chunk);
+            continue;
+        }
+        generated++;
     }
 
     world->generated_this_frame += generated;

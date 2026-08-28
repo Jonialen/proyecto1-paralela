@@ -93,6 +93,15 @@ typedef struct {
     Chunk *chunk;
 } ChunkSlot;
 
+/* A chunk that has been asked for but not yet built. Streaming collects these
+ * first, generates them in parallel, then inserts them: generation is a pure
+ * function of the coordinates and the seed, while insertion touches the shared
+ * map and has to stay serial. */
+typedef struct {
+    int cx, cz;
+    Chunk *chunk;
+} PendingChunk;
+
 typedef struct {
     ChunkSlot *slots;
     size_t capacity;      /* power of two */
@@ -101,6 +110,10 @@ typedef struct {
     size_t max_chunks;
     TerrainParams params;
     uint32_t frame;
+
+    /* Reused across frames so streaming allocates nothing after warmup. */
+    PendingChunk *pending;
+    size_t pending_capacity;
 
     /* Per-frame counters, for the HUD and for the benchmark report. */
     size_t generated_this_frame;
