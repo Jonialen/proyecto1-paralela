@@ -5,6 +5,9 @@ Distribuida (UVG). `N` first-person explorers fly over an endless procedurally
 generated world in split-screen, rendered entirely by our own software
 rasterizer. SDL2 only opens the window and blits the finished framebuffer.
 
+`CLAUDE.md` is a symlink to this file: the two conventions name the same
+document so there is only one set of instructions to keep current.
+
 Read `README.md` for what the program does, `docs/matematica.md` for the maths
 behind each pipeline stage, and `docs/decisiones.md` for why the design is the
 way it is. **Check `docs/decisiones.md` before changing anything structural** —

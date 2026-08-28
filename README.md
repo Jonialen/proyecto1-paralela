@@ -26,6 +26,7 @@ Texture packs are optional, user-supplied and never committed. See
 | `docs/matematica.md` | The maths behind each pipeline stage and why it is that way |
 | `docs/decisiones.md` | Design decision record: what, why, alternatives, consequences |
 | `AGENTS.md` | Working practices, invariants and the determinism contract |
+| `CLAUDE.md` | Symlink to `AGENTS.md`, so both conventions find the same file |
 | `THIRD_PARTY.md` | Dependencies, and why no third-party asset ships here |
 
 ## Build and run
