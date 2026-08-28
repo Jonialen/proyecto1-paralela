@@ -412,18 +412,30 @@ void raster_triangle(Framebuffer *fb, const ScreenTriangle *tri,
         return;
     float inv_area = 1.0f / area;
 
+    /* Edge functions are AFFINE in x: stepping one pixel to the right changes
+     * each by a constant. Evaluating them from scratch per pixel costs three
+     * multiply-subtract pairs each; stepping costs three adds.
+     *
+     * The row start is still evaluated exactly, so the error accumulated by
+     * stepping is bounded by the width of one triangle rather than the width of
+     * the framebuffer. (Pineda 1988.) */
+    float step0 = -(c->y - b->y);
+    float step1 = -(a->y - c->y);
+    float step2 = -(b->y - a->y);
+
     /* This double loop is the hot spot of the whole program: it is where the
-     * per-pixel work lives, and the natural target for parallelization later. */
+     * per-pixel work lives. */
     for (int y = min_y; y <= max_y; y++) {
         float py = (float)y + 0.5f;
+        float px0 = (float)min_x + 0.5f;
         size_t row = (size_t)y * fb->fb_width;
 
-        for (int x = min_x; x <= max_x; x++) {
-            float px = (float)x + 0.5f;
+        float w0 = edge_function(b, c, px0, py);
+        float w1 = edge_function(c, a, px0, py);
+        float w2 = edge_function(a, b, px0, py);
 
-            float w0 = edge_function(b, c, px, py);
-            float w1 = edge_function(c, a, px, py);
-            float w2 = edge_function(a, b, px, py);
+        for (int x = min_x; x <= max_x; x++,
+             w0 += step0, w1 += step1, w2 += step2) {
             /* area is negative, so inside means all edges are negative too. */
             if (w0 > 0.0f || w1 > 0.0f || w2 > 0.0f)
                 continue;
