@@ -446,14 +446,26 @@ no scratch buffers.
 
 | N | sequential | 8 threads | speedup | efficiency | FPS | 30 FPS floor |
 |---|---|---|---|---|---|---|
-| 1  |  31.2 ms |  8.3 ms | 3.79 | 47.4% | **121.3** | met |
-| 2  |  50.4 ms | 13.3 ms | 3.79 | 47.3% | **75.1** | met |
-| 4  |  99.6 ms | 28.7 ms | 3.47 | 43.4% | **34.9** | met |
-| 8  | 189.1 ms | 44.8 ms | 4.22 | 52.8% | 22.3 | no |
-| 16 | 368.9 ms | 81.3 ms | 4.54 | 56.7% | 12.3 | no |
+| 1  |  22.3 ms |  5.9 ms | 3.76 | 47.0% | **168.9** | met |
+| 2  |  25.0 ms |  8.5 ms | 2.96 | 37.0% | **118.4** | met |
+| 4  |  52.3 ms | 19.4 ms | 2.70 | 33.7% | **51.5** | met |
+| 8  |  90.6 ms | 23.4 ms | 3.86 | 48.3% | **42.7** | met |
+| 16 | 167.5 ms | 38.6 ms | 4.35 | 54.3% | 25.9 | close |
 
-**The floor is met at one, two and four explorers**, where the sequential build
-reached it nowhere.
+**The floor is met up to eight explorers**, where the first sequential build
+reached it nowhere. One explorer went from 20.4 FPS to 168.9 across the whole
+effort — a factor of 8.3, of which 3.8 is threads and the rest is work removed.
+
+#### Speedup fell while the program got faster
+
+Two and four explorers used to show 3.79x and 3.47x; they now show 2.96x and
+2.70x. Nothing regressed. Frustum culling and the cheaper cloud sampling made
+the *sequential* baseline much faster, so the fixed cost of the parallel
+machinery is a larger share of a smaller number.
+
+Speedup measures how well work divides, not how fast the program is. Optimizing
+the algorithm lowers it and is still the right thing to do — which is why the
+FPS column is there beside it.
 
 #### One word was worth 1.6x
 

@@ -13,6 +13,12 @@
 #define CLOUD_HEIGHT 70.0f
 #define CLOUD_SCALE 0.0022f
 
+/* The cloud field is smooth across the screen, so it is evaluated every
+ * CLOUD_STEP pixels along a row and interpolated in between. Three octaves of
+ * noise per sky pixel was 65% of the sky stage and a third of the whole frame;
+ * the field simply does not carry detail at pixel scale to justify that. */
+#define CLOUD_STEP 4
+
 static float clamp01(float v)
 {
     if (v < 0.0f) return 0.0f;
@@ -136,6 +142,20 @@ static float cloud_at(Vec3 eye, Vec3 dir, float drift)
     return density * fade;
 }
 
+/* View ray for one pixel of a row. The inverse of the projection: instead of
+ * taking a world point to the screen it takes a screen pixel to a direction. */
+static Vec3 ray_for_pixel(const Viewport *view, int x, float ndc_y,
+                          Vec3 forward, Vec3 right, Vec3 up,
+                          float tan_half_fov, float aspect)
+{
+    float ndc_x = 2.0f * ((float)x + 0.5f) / (float)view->width - 1.0f;
+    float sx = ndc_x * tan_half_fov * aspect;
+    float sy = ndc_y * tan_half_fov;
+    return vec3_normalize(vec3_make(forward.x + right.x * sx + up.x * sy,
+                                    forward.y + right.y * sx + up.y * sy,
+                                    forward.z + right.z * sx + up.z * sy));
+}
+
 void sky_render(Framebuffer *fb, const Viewport *view, const Sky *sky,
                 Vec3 eye, Vec3 forward, Vec3 right, Vec3 up,
                 float tan_half_fov, float aspect, int parallel)
@@ -159,6 +179,8 @@ void sky_render(Framebuffer *fb, const Viewport *view, const Sky *sky,
         /* +1 at the top of the screen, -1 at the bottom. */
         float ndc_y = 1.0f - 2.0f * ((float)y + 0.5f) / (float)view->height;
 
+        float cloud_left = 0.0f, cloud_right = 0.0f;
+
         for (int x = 0; x < view->width; x++) {
             size_t idx = row + (size_t)(view->x + x);
 
@@ -167,14 +189,8 @@ void sky_render(Framebuffer *fb, const Viewport *view, const Sky *sky,
             if (fb->depth[idx] < 1.0f)
                 continue;
 
-            float ndc_x = 2.0f * ((float)x + 0.5f) / (float)view->width - 1.0f;
-
-            float sx = ndc_x * tan_half_fov * aspect;
-            float sy = ndc_y * tan_half_fov;
-            Vec3 dir = vec3_normalize(vec3_make(
-                forward.x + right.x * sx + up.x * sy,
-                forward.y + right.y * sx + up.y * sy,
-                forward.z + right.z * sx + up.z * sy));
+            Vec3 dir = ray_for_pixel(view, x, ndc_y, forward, right, up,
+                                     tan_half_fov, aspect);
 
             /* Base gradient. The squared ramp keeps the bright band compressed
              * near the horizon, which is how a real sky reads. */
@@ -199,7 +215,21 @@ void sky_render(Framebuffer *fb, const Viewport *view, const Sky *sky,
                     color = color_lerp(color, sky->sun_tint, clamp01(glow * 0.85f));
             }
 
-            float cloud = cloud_at(eye, dir, drift);
+            /* Coarse cloud sampling: recompute only when crossing into a new
+             * segment, then interpolate towards the next sample. */
+            if (x % CLOUD_STEP == 0 || x == 0) {
+                cloud_left = (x == 0) ? cloud_at(eye, dir, drift) : cloud_right;
+                int nx = x + CLOUD_STEP;
+                if (nx >= view->width)
+                    nx = view->width - 1;
+                cloud_right = cloud_at(eye, ray_for_pixel(view, nx, ndc_y,
+                                                          forward, right, up,
+                                                          tan_half_fov, aspect),
+                                       drift);
+            }
+            float blend = (float)(x % CLOUD_STEP) / (float)CLOUD_STEP;
+            float cloud = cloud_left + (cloud_right - cloud_left) * blend;
+
             if (cloud > 0.0f) {
                 /* Clouds are lit by the same cycle: white at noon, orange at
                  * dusk, near black at night. */

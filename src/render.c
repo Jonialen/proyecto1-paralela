@@ -85,8 +85,15 @@ void framebuffer_free(Framebuffer *fb)
 
 void framebuffer_clear(Framebuffer *fb, uint32_t color)
 {
+    /* Whole-framebuffer passes, both trivially parallel over rows and both
+     * previously serial. At 960x720 the clear alone touches 5.5 MB every frame,
+     * which is small per pixel but not free once everything around it has been
+     * made eight times faster. */
     size_t pixels = (size_t)fb->fb_width * (size_t)fb->fb_height;
-    for (size_t i = 0; i < pixels; i++) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (long i = 0; i < (long)pixels; i++) {
         fb->color[i] = color;
         fb->depth[i] = 1.0f; /* far plane in NDC */
     }
@@ -101,6 +108,9 @@ void framebuffer_resolve(const Framebuffer *fb, uint32_t *out)
     }
 
     int samples = s * s;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (int y = 0; y < fb->height; y++) {
         for (int x = 0; x < fb->width; x++) {
             uint32_t r = 0, g = 0, b = 0;
