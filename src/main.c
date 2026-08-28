@@ -437,8 +437,10 @@ static size_t render_frame(Framebuffer *fb, Scene *scene, float t, FrameTimings 
         }
 
     double t0 = timings ? now_seconds() : 0.0;
+    /* schedule(runtime) on the three measured stages, so --schedule selects the
+     * policy and the two can be compared without rebuilding. */
 #ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(runtime)
 #endif
     for (int i = 0; i < n; i++) {
         ViewTask *view = &scene->views[scene->tasks[i].view];
@@ -478,7 +480,7 @@ static size_t render_frame(Framebuffer *fb, Scene *scene, float t, FrameTimings 
         }
 
 #ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(runtime)
 #endif
     for (int i = 0; i < n; i++) {
         ViewTask *view = &scene->views[scene->tasks[i].view];
@@ -506,7 +508,7 @@ static size_t render_frame(Framebuffer *fb, Scene *scene, float t, FrameTimings 
     }
 
 #ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(runtime)
 #endif
     for (int i = 0; i < n; i++) {
         ViewTask *view = &scene->views[scene->tasks[i].view];
@@ -691,7 +693,7 @@ static void print_usage(const char *prog)
     printf("      --dump PATH   render one frame headless into a binary PPM file\n");
     printf("      --survey N    sample terrain over an NxN block area and report\n");
     printf("      --threads N   OpenMP threads (default: all cores; 0 = auto)\n");
-    printf("      --schedule S  'static' or 'dynamic' loop schedule (default static)\n");
+    printf("      --schedule S  'static' or 'dynamic' loop schedule (default dynamic)\n");
     printf("      --help        show this message\n");
 }
 
@@ -1179,7 +1181,7 @@ static int run_interactive(const Options *opt)
 int main(int argc, char **argv)
 {
     Options opt = { 960, 720, 1, 1, 96.0f, 320.0f, WORLD_DEFAULT_MAX_CHUNKS,
-                    180.0f, 1337u, 0, SCENE_CHUNK, 0, 3, 0, 0, 0, NULL, NULL };
+                    180.0f, 1337u, 0, SCENE_CHUNK, 0, 3, 0, 0, 1, NULL, NULL };
 
     textures_init();
 

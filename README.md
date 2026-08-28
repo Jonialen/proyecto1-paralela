@@ -484,18 +484,32 @@ already parallel: with all three stages split, the same configuration reaches
 
 ### Scheduling policy
 
-| N | `static` | `dynamic` | winner |
-|---|---|---|---|
-| 4  |  60.8 ms |  82.4 ms | static, by 35% |
-| 8  |  79.4 ms |  85.7 ms | static, by 8% |
-| 16 | 139.3 ms | 124.7 ms | **dynamic, by 10%** |
+`--schedule` selects the policy for the three measured stages, which are
+compiled with `schedule(runtime)`. Default is `dynamic`.
 
-The crossover is the interesting part. Per-view cost is deliberately uneven —
-the spread at sixteen explorers is **6.0x** between the lightest and heaviest
-view — but unevenness alone does not make `dynamic` win. With four views on
-eight threads every thread takes at most one view, so there is nothing to
-rebalance and dynamic only adds its own overhead. Only once threads carry two or
-more views does the imbalance outweigh that overhead.
+| N | `static` | `dynamic` | dynamic wins by |
+|---|---|---|---|
+| 1  | 11.35 ms |  5.82 ms | **48.7%** |
+| 2  | 13.02 ms |  7.26 ms | 44.3% |
+| 4  | 19.08 ms | 13.95 ms | 26.9% |
+| 8  | 27.10 ms | 23.09 ms | 14.8% |
+| 16 | 44.45 ms | 41.41 ms | 6.8% |
+
+Dynamic wins everywhere, and its advantage **shrinks** as the explorer count
+grows. That is the opposite of what the same comparison showed before the tasks
+were flattened, and the reversal is instructive: the right policy depends on the
+tasks, not on the program.
+
+When a task was a whole view, four views on eight threads gave every thread at
+most one task. There was nothing to rebalance and dynamic only charged its own
+overhead, so static won. Now a task is a chunk row, a screen band or a slice of
+sky, and those vary enormously — a row through the middle of the render disk
+holds a dozen chunks while a row at its edge holds one; a band across the
+horizon covers far more filled pixels than a band of open sky.
+
+The advantage narrows at high N because each view is then cut into fewer pieces
+(the split count is derived from threads over views), so the tasks are coarser
+and more uniform again.
 
 ### A warning about measurement
 
