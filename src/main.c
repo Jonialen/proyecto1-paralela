@@ -388,11 +388,16 @@ static size_t render_frame(Framebuffer *fb, Scene *scene, float t, FrameTimings 
     /* The block scene is a single cube for inspecting textures; it has no chunk
      * rows to flatten, so it keeps the simple path. */
     if (scene->scene != SCENE_CHUNK) {
-        for (int i = 0; i < scene->view_count; i++)
-            render_view(fb, &scene->views[i], scene, t, timings != NULL, 1);
         size_t total = 0;
-        for (int i = 0; i < scene->view_count; i++)
+        for (int i = 0; i < scene->view_count; i++) {
+            render_view(fb, &scene->views[i], scene, t, timings != NULL, 1);
             total += scene->views[i].triangle_count;
+            if (timings) {
+                timings->geometry += scene->views[i].seconds_geometry;
+                timings->raster += scene->views[i].seconds_raster;
+                timings->sky += scene->views[i].seconds_sky;
+            }
+        }
         return total;
     }
 
@@ -404,11 +409,16 @@ static size_t render_frame(Framebuffer *fb, Scene *scene, float t, FrameTimings 
     /* With one thread the flattening buys nothing and costs the per-row buffers
      * and the stitching that puts them back together. Take the direct path. */
     if (threads <= 1) {
-        for (int i = 0; i < scene->view_count; i++)
-            render_view(fb, &scene->views[i], scene, t, timings != NULL, 0);
         size_t total = 0;
-        for (int i = 0; i < scene->view_count; i++)
+        for (int i = 0; i < scene->view_count; i++) {
+            render_view(fb, &scene->views[i], scene, t, timings != NULL, 0);
             total += scene->views[i].triangle_count;
+            if (timings) {
+                timings->geometry += scene->views[i].seconds_geometry;
+                timings->raster += scene->views[i].seconds_raster;
+                timings->sky += scene->views[i].seconds_sky;
+            }
+        }
         return total;
     }
 
