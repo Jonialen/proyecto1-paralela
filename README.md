@@ -446,14 +446,29 @@ no scratch buffers.
 
 | N | sequential | 8 threads | speedup | efficiency | FPS | 30 FPS floor |
 |---|---|---|---|---|---|---|
-| 1  |  31.4 ms | 12.2 ms | 2.56 | 32.0% | **81.7** | met |
-| 2  |  50.3 ms | 17.9 ms | 2.81 | 35.1% | **55.9** | met |
-| 4  | 103.3 ms | 34.4 ms | 3.00 | 37.5% | 29.0 | just under |
-| 8  | 193.2 ms | 47.6 ms | 4.06 | 50.8% | 21.0 | no |
-| 16 | 381.3 ms | 87.0 ms | 4.38 | 54.8% | 11.5 | no |
+| 1  |  31.2 ms |  8.3 ms | 3.79 | 47.4% | **121.3** | met |
+| 2  |  50.4 ms | 13.3 ms | 3.79 | 47.3% | **75.1** | met |
+| 4  |  99.6 ms | 28.7 ms | 3.47 | 43.4% | **34.9** | met |
+| 8  | 189.1 ms | 44.8 ms | 4.22 | 52.8% | 22.3 | no |
+| 16 | 368.9 ms | 81.3 ms | 4.54 | 56.7% | 12.3 | no |
 
-**The floor is met at one and two explorers and all but met at four**, where the
-sequential build reached it nowhere.
+**The floor is met at one, two and four explorers**, where the sequential build
+reached it nowhere.
+
+#### One word was worth 1.6x
+
+The sky loop first used `schedule(static)`, and the sky then scaled at only 2.9x
+while geometry and rasterization reached 5-6x. The reason is visible in the
+scene: rows near the top of a pane are open sky and pay the full three-octave
+cloud lookup, rows near the bottom are covered by terrain and the depth test
+rejects them immediately. A static split hands one thread every expensive row
+and another every cheap one.
+
+With `schedule(dynamic, 8)` the sky went from 6.91 ms to 2.69 ms, the frame from
+13.0 ms to 8.1 ms, and one explorer from 77 to 121 FPS.
+
+The lesson generalizes: **an even split of iterations is not an even split of
+work.** Look at what each iteration actually does before choosing a policy.
 
 ### Thread scaling (`-n 8`)
 

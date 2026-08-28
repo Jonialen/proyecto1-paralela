@@ -145,8 +145,12 @@ void sky_render(Framebuffer *fb, const Viewport *view, const Sky *sky,
 #endif
     float drift = sky->phase * 3.0f; /* clouds crawl across the day */
 
+    /* schedule(dynamic) and not static: rows near the top are open sky and pay
+     * the full cloud lookup, rows near the bottom are covered by terrain and
+     * skip almost everything. A static split hands one thread all the expensive
+     * rows and another all the cheap ones. */
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) if(parallel)
+#pragma omp parallel for schedule(dynamic, 8) if(parallel)
 #endif
     for (int y = 0; y < view->height; y++) {
         int py = view->y + y;
