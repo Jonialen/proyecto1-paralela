@@ -74,6 +74,9 @@ void tribuf_init(TriangleBuffer *buf);
 void tribuf_free(TriangleBuffer *buf);
 void tribuf_clear(TriangleBuffer *buf); /* keeps the allocation for reuse */
 int tribuf_push(TriangleBuffer *buf, const ScreenTriangle *tri);
+/* Appends every triangle of `src` to `dst`, preserving order. Used to stitch
+ * per-worker buffers back together after a parallel geometry pass. */
+int tribuf_append(TriangleBuffer *dst, const TriangleBuffer *src);
 
 /* ------------------------------------------------------------ cube stage */
 
@@ -127,7 +130,17 @@ size_t cube_emit(TriangleBuffer *out, const Block *block, Mat4 model, Mat4 vp,
 void raster_triangle(Framebuffer *fb, const ScreenTriangle *tri,
                      int clip_min_x, int clip_min_y, int clip_max_x, int clip_max_y);
 
-/* Rasterizes every triangle in the buffer over the whole framebuffer. */
-void raster_flush(Framebuffer *fb, const TriangleBuffer *tris);
+/* Rasterizes every triangle in the buffer into one viewport.
+ *
+ * `parallel` splits the viewport into horizontal bands, one worker each. A band
+ * owns its rows exclusively, so no two workers ever touch the same colour or
+ * depth slot -- which is why the split is by SCREEN REGION and never by
+ * triangle: two triangles can cover one pixel, and the depth test is a
+ * read-modify-write of that shared slot.
+ *
+ * Every worker walks the whole triangle list; triangles outside its band are
+ * rejected by the clamped bounding box each ScreenTriangle already carries. */
+void raster_flush(Framebuffer *fb, const TriangleBuffer *tris,
+                  const Viewport *view, int parallel);
 
 #endif /* RENDER_H */

@@ -399,33 +399,85 @@ make                    # builds cubeview and cubeview-seq
 `--threads` and `--schedule` are accepted and ignored by the sequential build, so
 the same command line drives both and comparisons are easy to script.
 
-### Level 1: parallel over views
+### Two levels, chosen at runtime
+
+OpenMP leaves nested parallelism off by default, so an inner parallel region
+inside an already-parallel loop simply runs serially. The two levels cannot both
+be active, and the choice is therefore explicit.
+
+**Level 1 — over views.** The loop over `ViewTask`s. Views share nothing:
+disjoint framebuffer rectangles, private triangle buffers, read-only world. No
+lock, no atomic, no reduction.
 
 ```c
-#pragma omp parallel for schedule(runtime)
+#pragma omp parallel for schedule(runtime) if(parallel_views)
 for (int i = 0; i < scene->view_count; i++)
-    render_view(fb, &scene->views[i], scene, t, measure);
+    render_view(fb, &scene->views[i], scene, t, measure, !parallel_views);
 ```
 
-Views share nothing — disjoint framebuffer rectangles, private triangle buffers,
-read-only world — so there is no lock, no atomic and no reduction. Stage timings
-live in each `ViewTask` and are summed after the loop; a shared accumulator
-would race on exactly the numbers the speedup is judged on.
+**Level 2 — inside one view.** All three stages split:
+
+- *Geometry* by **chunk row**, each row filling its own buffer, stitched back in
+  row order afterwards. Row order is exactly the order the serial scan produces,
+  which is what keeps the output identical whatever the thread count. Splitting
+  by an arbitrary partition of the chunks would not.
+- *Rasterization* by **screen band**. Never by triangle: two triangles can cover
+  one pixel and the depth test is a read-modify-write of that shared slot. Each
+  band owns its rows exclusively. `raster_triangle()` takes a clip rectangle for
+  exactly this, and each `ScreenTriangle` carries a clamped bounding box so a
+  band rejects what it does not touch.
+- *Sky* by **row**, which writes disjoint pixels and only reads depth.
+
+**The rule is `view_count >= threads`**, and the crossover sits exactly there:
+
+| N | by view | inside a view |
+|---|---|---|
+| 2  | 1.62x | **2.25x** |
+| 4  | 2.59x | **2.92x** |
+| 8  | **4.16x** | 2.99x |
+| 16 | **4.38x** | 3.05x |
+
+Below the thread count, splitting by view leaves threads idle — two views on
+eight threads uses two of them — while the inner split puts all eight on the one
+frame. At or above it, the view loop saturates the threads with no stitching and
+no scratch buffers.
 
 ### Speedup (960x720, `--view 96 --ssaa 1`, 8 threads)
 
-| N | sequential | 8 threads | speedup | efficiency |
-|---|---|---|---|---|
-| 1  |  49.1 ms |  49.1 ms | 1.00 | 12.5% |
-| 2  |  79.1 ms |  48.6 ms | 1.63 | 20.4% |
-| 4  | 157.1 ms |  64.5 ms | 2.44 | 30.4% |
-| 8  | 297.6 ms |  74.8 ms | 3.98 | 49.7% |
-| 16 | 569.5 ms | 160.7 ms | 3.54 | 44.3% |
+| N | sequential | 8 threads | speedup | efficiency | FPS | 30 FPS floor |
+|---|---|---|---|---|---|---|
+| 1  |  31.4 ms | 12.2 ms | 2.56 | 32.0% | **81.7** | met |
+| 2  |  50.3 ms | 17.9 ms | 2.81 | 35.1% | **55.9** | met |
+| 4  | 103.3 ms | 34.4 ms | 3.00 | 37.5% | 29.0 | just under |
+| 8  | 193.2 ms | 47.6 ms | 4.06 | 50.8% | 21.0 | no |
+| 16 | 381.3 ms | 87.0 ms | 4.38 | 54.8% | 11.5 | no |
 
-**At one explorer the speedup is exactly 1.00, and that is not a defect.** The
-loop has a single iteration: there is nothing to divide. This is the limit of a
-view-level decomposition and the reason a second level is needed, since `-n 1`
-is also the configuration closest to the frame-rate floor.
+**The floor is met at one and two explorers and all but met at four**, where the
+sequential build reached it nowhere.
+
+### Thread scaling (`-n 8`)
+
+| threads | ms | speedup | efficiency |
+|---|---|---|---|
+| 1 | 202.6 | 0.96 | 96.3% |
+| 2 | 116.7 | 1.67 | 83.6% |
+| 4 |  68.1 | 2.87 | 71.7% |
+| 8 |  47.9 | 4.07 | 50.9% |
+
+Efficiency decays the way it always does. One thread at 0.96 rather than 1.00 is
+the cost of the parallel machinery itself, which is small and real.
+
+### Amdahl, and why the sky mattered
+
+At one explorer the sequential split was geometry 28%, rasterization 30%, sky
+41%. Parallelizing geometry alone caps the speedup at
+
+    1 / (0.72 + 0.28/8) = 1.32x
+
+and the measured figure was 1.24x — 94% of a ceiling that was simply too low.
+The gain came from raising the parallel fraction, not from optimizing what was
+already parallel: with all three stages split, the same configuration reaches
+2.56x.
 
 ### Scheduling policy
 
@@ -441,6 +493,16 @@ view — but unevenness alone does not make `dynamic` win. With four views on
 eight threads every thread takes at most one view, so there is nothing to
 rebalance and dynamic only adds its own overhead. Only once threads carry two or
 more views does the imbalance outweigh that overhead.
+
+### A warning about measurement
+
+These numbers move a great deal with system load, and the parallel build is hurt
+worse than the sequential one because it competes for the same cores. The same
+configuration measured 0.87x on a machine at load 8.5 and 1.24x on the same
+machine at load 2.0.
+
+A design decision was very nearly made on the strength of the polluted figure.
+**Check the load average before trusting a speedup.**
 
 ## Determinism
 

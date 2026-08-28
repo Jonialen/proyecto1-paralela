@@ -34,8 +34,12 @@ Sky sky_make(float phase);
  *
  * `tan_half_fov` and `aspect` reconstruct the view ray per pixel from the
  * camera basis. */
+/* `parallel` splits the rows across threads. Rows write disjoint pixels and only
+ * read the depth buffer, so there is nothing to synchronize. Pass 0 when the
+ * caller is already inside a parallel region: OpenMP leaves nesting off, so an
+ * inner region would simply run serially and only add overhead. */
 void sky_render(Framebuffer *fb, const Viewport *view, const Sky *sky,
                 Vec3 eye, Vec3 forward, Vec3 right, Vec3 up,
-                float tan_half_fov, float aspect);
+                float tan_half_fov, float aspect, int parallel);
 
 #endif /* SKY_H */

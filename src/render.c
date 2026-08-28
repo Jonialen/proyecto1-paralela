@@ -4,6 +4,10 @@
 #include <string.h>
 #include <math.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 /* ---------------------------------------------------------------- geometry */
 
 typedef struct {
@@ -146,6 +150,28 @@ int tribuf_push(TriangleBuffer *buf, const ScreenTriangle *tri)
         buf->capacity = next;
     }
     buf->data[buf->count++] = *tri;
+    return 1;
+}
+
+int tribuf_append(TriangleBuffer *dst, const TriangleBuffer *src)
+{
+    if (src->count == 0)
+        return 1;
+
+    size_t needed = dst->count + src->count;
+    if (needed > dst->capacity) {
+        size_t next = dst->capacity ? dst->capacity : 1024;
+        while (next < needed)
+            next *= 2;
+        ScreenTriangle *grown = realloc(dst->data, next * sizeof(ScreenTriangle));
+        if (!grown)
+            return 0;
+        dst->data = grown;
+        dst->capacity = next;
+    }
+
+    memcpy(dst->data + dst->count, src->data, src->count * sizeof(ScreenTriangle));
+    dst->count = needed;
     return 1;
 }
 
@@ -414,8 +440,38 @@ void raster_triangle(Framebuffer *fb, const ScreenTriangle *tri,
     }
 }
 
-void raster_flush(Framebuffer *fb, const TriangleBuffer *tris)
+void raster_flush(Framebuffer *fb, const TriangleBuffer *tris,
+                  const Viewport *view, int parallel)
 {
-    for (size_t i = 0; i < tris->count; i++)
-        raster_triangle(fb, &tris->data[i], 0, 0, fb->fb_width - 1, fb->fb_height - 1);
+    int x0 = view->x;
+    int x1 = view->x + view->width - 1;
+
+    if (!parallel) {
+        for (size_t i = 0; i < tris->count; i++)
+            raster_triangle(fb, &tris->data[i], x0, view->y,
+                            x1, view->y + view->height - 1);
+        return;
+    }
+
+    /* More bands than threads so dynamic scheduling has something to balance:
+     * a band across the horizon carries far more covered pixels than one over
+     * empty sky. */
+    int bands = 1;
+#ifdef _OPENMP
+    bands = omp_get_max_threads() * 4;
+#endif
+    if (bands > view->height)
+        bands = view->height;
+    if (bands < 1)
+        bands = 1;
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+    for (int b = 0; b < bands; b++) {
+        int y0 = view->y + (int)((long)view->height * b / bands);
+        int y1 = view->y + (int)((long)view->height * (b + 1) / bands) - 1;
+        for (size_t i = 0; i < tris->count; i++)
+            raster_triangle(fb, &tris->data[i], x0, y0, x1, y1);
+    }
 }

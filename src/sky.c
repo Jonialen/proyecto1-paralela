@@ -1,6 +1,10 @@
 #include "sky.h"
 #include "noise.h"
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include <math.h>
 
 #define SKY_PI 3.14159265358979323846f
@@ -134,10 +138,16 @@ static float cloud_at(Vec3 eye, Vec3 dir, float drift)
 
 void sky_render(Framebuffer *fb, const Viewport *view, const Sky *sky,
                 Vec3 eye, Vec3 forward, Vec3 right, Vec3 up,
-                float tan_half_fov, float aspect)
+                float tan_half_fov, float aspect, int parallel)
 {
+#ifndef _OPENMP
+    (void)parallel; /* the sequential build has nothing to split */
+#endif
     float drift = sky->phase * 3.0f; /* clouds crawl across the day */
 
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if(parallel)
+#endif
     for (int y = 0; y < view->height; y++) {
         int py = view->y + y;
         size_t row = (size_t)py * fb->fb_width;

@@ -136,9 +136,19 @@ size_t world_end_frame(World *world);
  * the triangle order does not depend on which chunks happened to load first --
  * without that, two runs would produce different output and the byte-identical
  * --dump check would be worthless. */
+/* Rows of chunks a view can span at the largest supported render distance.
+ * world_emit_view() parallelizes over rows, one scratch buffer each. */
+#define WORLD_MAX_CHUNK_ROWS 320
+
+/* `rows` is optional scratch, one TriangleBuffer per chunk row. When it is
+ * supplied and large enough, the geometry stage runs the rows in parallel and
+ * stitches them back together IN ROW ORDER, which is exactly the order the
+ * serial scan produces -- so the output is identical whatever the thread count.
+ * Pass NULL to force the serial path. */
 size_t world_emit_view(TriangleBuffer *out, const World *world, Vec3 camera_pos,
                        float render_radius, Mat4 vp, const Light *light,
-                       const Viewport *view);
+                       const Viewport *view,
+                       TriangleBuffer *rows, int row_capacity);
 
 /* Solid blocks across every loaded chunk, for reporting culling savings. */
 size_t world_solid_blocks(const World *world);

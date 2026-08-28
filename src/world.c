@@ -1,6 +1,10 @@
 #include "world.h"
 #include "noise.h"
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -683,73 +687,108 @@ static uint32_t neighbourhood_mask(const Chunk *chunk, const ChunkNeighbors *n,
     return mask;
 }
 
+/* Emits one row of chunks. Split out so the row loop can run either serially or
+ * in parallel without duplicating the body. */
+static size_t emit_chunk_row(TriangleBuffer *out, const World *world, int cz,
+                             int center_cx, int reach, Vec3 camera_pos,
+                             float radius_sq, Mat4 vp, const Light *light,
+                             const Viewport *view)
+{
+    size_t emitted = 0;
+
+    for (int cx = center_cx - reach; cx <= center_cx + reach; cx++) {
+        float ox = ((float)cx + 0.5f) * CHUNK_SIZE_X - camera_pos.x;
+        float oz = ((float)cz + 0.5f) * CHUNK_SIZE_Z - camera_pos.z;
+        if (ox * ox + oz * oz > radius_sq)
+            continue;
+
+        const Chunk *chunk = world_find_chunk(world, cx, cz);
+        if (!chunk)
+            continue;
+
+        ChunkNeighbors neighbors = {
+            world_find_chunk(world, cx - 1, cz),
+            world_find_chunk(world, cx + 1, cz),
+            world_find_chunk(world, cx, cz - 1),
+            world_find_chunk(world, cx, cz + 1)
+        };
+
+        float base_x = (float)cx * CHUNK_SIZE_X;
+        float base_z = (float)cz * CHUNK_SIZE_Z;
+
+        int y_limit = (int)chunk->height_limit;
+        for (int y = 0; y < y_limit; y++) {
+            for (int z = 0; z < CHUNK_SIZE_Z; z++) {
+                for (int x = 0; x < CHUNK_SIZE_X; x++) {
+                    uint8_t id = chunk->blocks[chunk_index(x, y, z)];
+                    if (id == BLOCK_AIR)
+                        continue;
+
+                    unsigned mask = face_mask_at(chunk, &neighbors, x, y, z);
+                    if (mask == 0)
+                        continue; /* fully buried */
+
+                    const Block *block = block_from_id(id);
+                    if (!block)
+                        continue;
+
+                    /* Ambient occlusion needs the diagonals, which the six-way
+                     * face mask never looks at. Only built for blocks that
+                     * actually show a face. */
+                    uint32_t occlusion = neighbourhood_mask(chunk, &neighbors, x, y, z);
+
+                    Mat4 model = mat4_translate(base_x + (float)x + 0.5f,
+                                                (float)y + 0.5f,
+                                                base_z + (float)z + 0.5f);
+                    emitted += cube_emit(out, block, model, vp, light,
+                                         mask, occlusion, view);
+                }
+            }
+        }
+    }
+
+    return emitted;
+}
+
 size_t world_emit_view(TriangleBuffer *out, const World *world, Vec3 camera_pos,
                        float render_radius, Mat4 vp, const Light *light,
-                       const Viewport *view)
+                       const Viewport *view,
+                       TriangleBuffer *rows, int row_capacity)
 {
     int center_cx = floor_div((int)floorf(camera_pos.x), CHUNK_SIZE_X);
     int center_cz = floor_div((int)floorf(camera_pos.z), CHUNK_SIZE_Z);
     int reach = (int)ceilf(render_radius / (float)CHUNK_SIZE_X);
     float radius_sq = render_radius * render_radius;
+    int row_count = 2 * reach + 1;
 
-    size_t emitted = 0;
-
-    /* Sorted box scan: the visit order depends only on the camera position, not
-     * on hash layout or load history, so two runs emit triangles in the same
-     * order and produce byte-identical frames. */
-    for (int cz = center_cz - reach; cz <= center_cz + reach; cz++) {
-        for (int cx = center_cx - reach; cx <= center_cx + reach; cx++) {
-            float ox = ((float)cx + 0.5f) * CHUNK_SIZE_X - camera_pos.x;
-            float oz = ((float)cz + 0.5f) * CHUNK_SIZE_Z - camera_pos.z;
-            if (ox * ox + oz * oz > radius_sq)
-                continue;
-
-            const Chunk *chunk = world_find_chunk(world, cx, cz);
-            if (!chunk)
-                continue;
-
-            ChunkNeighbors neighbors = {
-                world_find_chunk(world, cx - 1, cz),
-                world_find_chunk(world, cx + 1, cz),
-                world_find_chunk(world, cx, cz - 1),
-                world_find_chunk(world, cx, cz + 1)
-            };
-
-            float base_x = (float)cx * CHUNK_SIZE_X;
-            float base_z = (float)cz * CHUNK_SIZE_Z;
-
-            int y_limit = (int)chunk->height_limit;
-            for (int y = 0; y < y_limit; y++) {
-                for (int z = 0; z < CHUNK_SIZE_Z; z++) {
-                    for (int x = 0; x < CHUNK_SIZE_X; x++) {
-                        uint8_t id = chunk->blocks[chunk_index(x, y, z)];
-                        if (id == BLOCK_AIR)
-                            continue;
-
-                        unsigned mask = face_mask_at(chunk, &neighbors, x, y, z);
-                        if (mask == 0)
-                            continue; /* fully buried */
-
-                        const Block *block = block_from_id(id);
-                        if (!block)
-                            continue;
-
-                        /* Ambient occlusion needs the diagonals, which the
-                         * six-way face mask never looks at. Only built for
-                         * blocks that actually show a face. */
-                        uint32_t occlusion = neighbourhood_mask(chunk, &neighbors,
-                                                                x, y, z);
-
-                        Mat4 model = mat4_translate(base_x + (float)x + 0.5f,
-                                                    (float)y + 0.5f,
-                                                    base_z + (float)z + 0.5f);
-                        emitted += cube_emit(out, block, model, vp, light,
-                                             mask, occlusion, view);
-                    }
-                }
-            }
-        }
+    /* Serial path: one buffer, rows visited in order. */
+    if (!rows || row_capacity < row_count) {
+        size_t emitted = 0;
+        for (int r = 0; r < row_count; r++)
+            emitted += emit_chunk_row(out, world, center_cz - reach + r,
+                                      center_cx, reach, camera_pos, radius_sq,
+                                      vp, light, view);
+        return emitted;
     }
+
+    /* Parallel path. Each row fills its OWN buffer, so no two workers touch the
+     * same memory. Rows are then stitched back in row order, which is exactly
+     * the order the serial scan produces -- that is what keeps the output
+     * identical whatever the thread count, and it is why the split is by row
+     * rather than by an arbitrary partition of the chunks. */
+    size_t emitted = 0;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic) reduction(+:emitted)
+#endif
+    for (int r = 0; r < row_count; r++) {
+        tribuf_clear(&rows[r]);
+        emitted += emit_chunk_row(&rows[r], world, center_cz - reach + r,
+                                  center_cx, reach, camera_pos, radius_sq,
+                                  vp, light, view);
+    }
+
+    for (int r = 0; r < row_count; r++)
+        tribuf_append(out, &rows[r]);
 
     return emitted;
 }
