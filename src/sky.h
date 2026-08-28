@@ -42,4 +42,10 @@ void sky_render(Framebuffer *fb, const Viewport *view, const Sky *sky,
                 Vec3 eye, Vec3 forward, Vec3 right, Vec3 up,
                 float tan_half_fov, float aspect, int parallel);
 
+/* Fills only rows [y0, y1] of the viewport. Lets a caller schedule sky slices
+ * from several views in one flat parallel loop instead of one loop per view. */
+void sky_render_slice(Framebuffer *fb, const Viewport *view, const Sky *sky,
+                      Vec3 eye, Vec3 forward, Vec3 right, Vec3 up,
+                      float tan_half_fov, float aspect, int y0, int y1);
+
 #endif /* SKY_H */

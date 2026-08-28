@@ -77,7 +77,34 @@ typedef struct {
      * allocations after the first. */
     TriangleBuffer *rows;
     int row_capacity;
+
+    /* Per-frame camera state, derived once in the setup pass so every task that
+     * touches this view reads it instead of recomputing it. */
+    Mat4 vp;
+    Vec3 eye, forward, right, up;
+    ViewFrustum frustum;
+    int row_count;
 } ViewTask;
+
+/* One unit of parallel work: an item within a view.
+ *
+ * Flattening (view, item) into a single list is what keeps every thread busy at
+ * every explorer count. Splitting by view alone gives coarse tasks -- sixteen
+ * views with a 6x cost spread means the heaviest view sets the frame time --
+ * while splitting inside one view at a time pays the cost of entering a
+ * parallel region once per view per stage. One flat list of fine tasks per
+ * stage avoids both. */
+typedef struct {
+    int view;
+    int item;
+} FlatTask;
+
+/* Tasks aimed for per stage: enough per thread that dynamic scheduling has
+ * something to balance, few enough that scheduling does not dominate. Bands and
+ * slices are derived from this and the view count, so one view is cut finely
+ * and sixteen views are each cut coarsely. */
+#define TASKS_PER_THREAD 4
+#define MIN_SPLITS_PER_VIEW 2
 
 typedef struct {
     int scene;
@@ -89,6 +116,9 @@ typedef struct {
     float day_length;
     Sky sky;          /* recomputed every frame from the elapsed time */
     char build_label[64];
+
+    FlatTask *tasks;      /* reused every frame; sized to the largest stage */
+    int task_capacity;
 } Scene;
 
 static const char *build_label(const Options *opt, char *buffer, size_t size);
@@ -139,6 +169,10 @@ static void scene_free(Scene *scene)
         free(scene->views);
         scene->views = NULL;
     }
+    free(scene->tasks);
+    scene->tasks = NULL;
+    scene->task_capacity = 0;
+
     if (scene->worlds) {
         for (int i = 0; i < scene->world_count; i++)
             world_free(&scene->worlds[i]);
@@ -291,6 +325,39 @@ static void render_view(Framebuffer *fb, ViewTask *view, const Scene *scene, flo
     }
 }
 
+/* Grows the shared task array. Reused across frames, so this allocates once. */
+static int scene_reserve_tasks(Scene *scene, int needed)
+{
+    if (needed <= scene->task_capacity)
+        return 1;
+    FlatTask *grown = realloc(scene->tasks, (size_t)needed * sizeof(FlatTask));
+    if (!grown)
+        return 0;
+    scene->tasks = grown;
+    scene->task_capacity = needed;
+    return 1;
+}
+
+/* Derives the per-frame camera state each view's tasks will read. */
+static void view_prepare(ViewTask *view, const Scene *scene, float t)
+{
+    float aspect = viewport_aspect(&view->viewport);
+    view->vp = camera_view_proj(&view->camera, t, aspect);
+    camera_basis(&view->camera, t, &view->eye, &view->forward,
+                 &view->right, &view->up);
+
+    view->frustum.eye = view->eye;
+    view->frustum.forward = view->forward;
+    view->frustum.right = view->right;
+    view->frustum.tan_half_h = tanf(view->camera.fov_y_rad * 0.5f) * aspect;
+
+    view->row_count = world_row_count(view->camera.view_distance);
+    if (view->row_count > view->row_capacity)
+        view->row_count = view->row_capacity;
+
+    (void)scene;
+}
+
 static size_t render_frame(Framebuffer *fb, Scene *scene, float t, FrameTimings *timings)
 {
     double stream_start = timings ? now_seconds() : 0.0;
@@ -309,67 +376,164 @@ static size_t render_frame(Framebuffer *fb, Scene *scene, float t, FrameTimings 
         }
         world_end_frame(world);
     }
-    if (timings)
-        timings->stream += now_seconds() - stream_start;
 
     /* The cycle advances with the same clock the explorers fly on, so a dump at
      * a given t always shows the same time of day. */
     scene->sky = sky_make(DAY_PHASE_START + t / scene->day_length);
+    if (timings)
+        timings->stream += now_seconds() - stream_start;
 
-    /* Phase 2 -- rendering. The world is read-only from here on. */
     framebuffer_clear(fb, 0x0E1622);
 
-    /* >>> THE PARALLEL DECOMPOSITION <<<
-     *
-     * Views share nothing: disjoint framebuffer rectangles, private triangle
-     * buffers, read-only access to the world. No lock, no atomic, no reduction.
-     *
-     * schedule(runtime) so the policy can be chosen from the command line:
-     * per-view cost is deliberately uneven, which is exactly the case where
-     * static and dynamic diverge. */
-    int measure = (timings != NULL);
+    /* The block scene is a single cube for inspecting textures; it has no chunk
+     * rows to flatten, so it keeps the simple path. */
+    if (scene->scene != SCENE_CHUNK) {
+        for (int i = 0; i < scene->view_count; i++)
+            render_view(fb, &scene->views[i], scene, t, timings != NULL, 1);
+        size_t total = 0;
+        for (int i = 0; i < scene->view_count; i++)
+            total += scene->views[i].triangle_count;
+        return total;
+    }
 
-    /* Which level of parallelism to use.
-     *
-     * OpenMP leaves nested parallelism off by default, so the two levels cannot
-     * both be active: an inner parallel for inside an already-parallel view loop
-     * simply runs serially. The choice is therefore explicit.
-     *
-     * The crossover sits exactly at the thread count, which is what the
-     * measurements show:
-     *
-     *     N        by view    inside a view
-     *     2          1.62x        2.25x
-     *     4          2.59x        2.92x
-     *     8          4.16x        2.99x
-     *     16         4.38x        3.05x
-     *
-     * Below the thread count, splitting by view leaves threads idle -- two
-     * views on eight threads uses two of them -- while the inner split uses all
-     * eight on the one frame. At or above it, the view loop saturates the
-     * threads with no stitching and no scratch buffers, and wins. */
     int threads = 1;
 #ifdef _OPENMP
     threads = omp_get_max_threads();
 #endif
-    int parallel_views = (scene->view_count >= threads);
+
+    /* With one thread the flattening buys nothing and costs the per-row buffers
+     * and the stitching that puts them back together. Take the direct path. */
+    if (threads <= 1) {
+        for (int i = 0; i < scene->view_count; i++)
+            render_view(fb, &scene->views[i], scene, t, timings != NULL, 0);
+        size_t total = 0;
+        for (int i = 0; i < scene->view_count; i++)
+            total += scene->views[i].triangle_count;
+        return total;
+    }
+
+    for (int i = 0; i < scene->view_count; i++)
+        view_prepare(&scene->views[i], scene, t);
+
+    /* How finely each view is cut, so the total lands near TASKS_PER_THREAD per
+     * thread whatever the explorer count. */
+    int splits = (threads * TASKS_PER_THREAD + scene->view_count - 1) / scene->view_count;
+    if (splits < MIN_SPLITS_PER_VIEW)
+        splits = MIN_SPLITS_PER_VIEW;
+
+    /* ---- Phase 2: geometry, one task per (view, chunk row) ---- */
+    int count = 0;
+    for (int v = 0; v < scene->view_count; v++)
+        count += scene->views[v].row_count;
+    if (!scene_reserve_tasks(scene, count))
+        return 0;
+
+    int n = 0;
+    for (int v = 0; v < scene->view_count; v++)
+        for (int r = 0; r < scene->views[v].row_count; r++) {
+            scene->tasks[n].view = v;
+            scene->tasks[n].item = r;
+            n++;
+        }
+
+    double t0 = timings ? now_seconds() : 0.0;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+    for (int i = 0; i < n; i++) {
+        ViewTask *view = &scene->views[scene->tasks[i].view];
+        int row = scene->tasks[i].item;
+        tribuf_clear(&view->rows[row]);
+        world_emit_row(&view->rows[row], view->world, view->eye,
+                       view->camera.view_distance, view->vp,
+                       &scene->sky.light, &view->viewport, &view->frustum, row);
+    }
+
+    /* Stitching, in row order within each view: exactly the order the serial
+     * scan produces, which is what keeps the output independent of how the
+     * rows were spread across threads. */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+    for (int v = 0; v < scene->view_count; v++) {
+        ViewTask *view = &scene->views[v];
+        tribuf_clear(&view->triangles);
+        for (int r = 0; r < view->row_count; r++)
+            tribuf_append(&view->triangles, &view->rows[r]);
+        view->triangle_count = view->triangles.count;
+    }
+    double t1 = timings ? now_seconds() : 0.0;
+
+    /* ---- Phase 3: rasterization, one task per (view, screen band) ---- */
+    int bands = splits;
+    count = scene->view_count * bands;
+    if (!scene_reserve_tasks(scene, count))
+        return 0;
+    n = 0;
+    for (int v = 0; v < scene->view_count; v++)
+        for (int b = 0; b < bands; b++) {
+            scene->tasks[n].view = v;
+            scene->tasks[n].item = b;
+            n++;
+        }
 
 #ifdef _OPENMP
-#pragma omp parallel for schedule(runtime) if(parallel_views)
+#pragma omp parallel for schedule(dynamic)
 #endif
-    for (int i = 0; i < scene->view_count; i++)
-        render_view(fb, &scene->views[i], scene, t, measure, !parallel_views);
+    for (int i = 0; i < n; i++) {
+        ViewTask *view = &scene->views[scene->tasks[i].view];
+        int b = scene->tasks[i].item;
+        const Viewport *vp = &view->viewport;
+        int y0 = vp->y + (int)((long)vp->height * b / bands);
+        int y1 = vp->y + (int)((long)vp->height * (b + 1) / bands) - 1;
+        for (size_t k = 0; k < view->triangles.count; k++)
+            raster_triangle(fb, &view->triangles.data[k],
+                            vp->x, y0, vp->x + vp->width - 1, y1);
+    }
+    double t2 = timings ? now_seconds() : 0.0;
 
-    size_t total = 0;
-    for (int i = 0; i < scene->view_count; i++) {
-        total += scene->views[i].triangle_count;
-        if (measure) {
-            /* Summed after the loop, never inside it. */
-            timings->geometry += scene->views[i].seconds_geometry;
-            timings->raster += scene->views[i].seconds_raster;
-            timings->sky += scene->views[i].seconds_sky;
+    /* ---- Phase 4: sky, one task per slice of rows ---- */
+    count = scene->view_count * splits;
+    if (!scene_reserve_tasks(scene, count))
+        return 0;
+    n = 0;
+    for (int v = 0; v < scene->view_count; v++) {
+        for (int sl = 0; sl < splits; sl++) {
+            scene->tasks[n].view = v;
+            scene->tasks[n].item = sl;
+            n++;
         }
     }
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+    for (int i = 0; i < n; i++) {
+        ViewTask *view = &scene->views[scene->tasks[i].view];
+        const Viewport *vp = &view->viewport;
+        int sl = scene->tasks[i].item;
+        int y0 = (int)((long)vp->height * sl / splits);
+        int y1 = (int)((long)vp->height * (sl + 1) / splits) - 1;
+        if (y1 >= vp->height)
+            y1 = vp->height - 1;
+        sky_render_slice(fb, vp, &scene->sky, view->eye, view->forward,
+                         view->right, view->up,
+                         tanf(view->camera.fov_y_rad * 0.5f),
+                         viewport_aspect(vp), y0, y1);
+    }
+    double t3 = timings ? now_seconds() : 0.0;
+
+    if (timings) {
+        /* Wall clock per phase now, not aggregate work: each phase is one
+         * parallel region and the parts add up to the whole again. */
+        timings->geometry += t1 - t0;
+        timings->raster += t2 - t1;
+        timings->sky += t3 - t2;
+    }
+
+    size_t total = 0;
+    for (int v = 0; v < scene->view_count; v++)
+        total += scene->views[v].triangle_count;
     return total;
 }
 

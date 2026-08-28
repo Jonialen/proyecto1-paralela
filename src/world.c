@@ -788,6 +788,27 @@ static size_t emit_chunk_row(TriangleBuffer *out, const World *world, int cz,
     return emitted;
 }
 
+int world_row_count(float render_radius)
+{
+    int reach = (int)ceilf(render_radius / (float)CHUNK_SIZE_X);
+    return 2 * reach + 1;
+}
+
+size_t world_emit_row(TriangleBuffer *out, const World *world, Vec3 camera_pos,
+                      float render_radius, Mat4 vp, const Light *light,
+                      const Viewport *view, const ViewFrustum *frustum,
+                      int row_index)
+{
+    int center_cx = floor_div((int)floorf(camera_pos.x), CHUNK_SIZE_X);
+    int center_cz = floor_div((int)floorf(camera_pos.z), CHUNK_SIZE_Z);
+    int reach = (int)ceilf(render_radius / (float)CHUNK_SIZE_X);
+
+    return emit_chunk_row(out, world, center_cz - reach + row_index,
+                          center_cx, reach, camera_pos,
+                          render_radius * render_radius,
+                          vp, light, view, frustum);
+}
+
 size_t world_emit_view(TriangleBuffer *out, const World *world, Vec3 camera_pos,
                        float render_radius, Mat4 vp, const Light *light,
                        const Viewport *view, const ViewFrustum *frustum,

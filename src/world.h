@@ -153,6 +153,18 @@ typedef struct {
  * world_emit_view() parallelizes over rows, one scratch buffer each. */
 #define WORLD_MAX_CHUNK_ROWS 320
 
+/* Number of chunk rows a view spans at this render distance. The caller needs
+ * it to build a flat task list across several views. */
+int world_row_count(float render_radius);
+
+/* Emits one chunk row, addressed by index rather than by chunk coordinate.
+ * Rows are independent, so a caller can run any set of (view, row) pairs
+ * concurrently as long as each writes its own buffer. */
+size_t world_emit_row(TriangleBuffer *out, const World *world, Vec3 camera_pos,
+                      float render_radius, Mat4 vp, const Light *light,
+                      const Viewport *view, const ViewFrustum *frustum,
+                      int row_index);
+
 /* `rows` is optional scratch, one TriangleBuffer per chunk row. When it is
  * supplied and large enough, the geometry stage runs the rows in parallel and
  * stitches them back together IN ROW ORDER, which is exactly the order the

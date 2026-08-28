@@ -399,62 +399,38 @@ make                    # builds cubeview and cubeview-seq
 `--threads` and `--schedule` are accepted and ignored by the sequential build, so
 the same command line drives both and comparisons are easy to script.
 
-### Two levels, chosen at runtime
+### One flat task list per stage
 
-OpenMP leaves nested parallelism off by default, so an inner parallel region
-inside an already-parallel loop simply runs serially. The two levels cannot both
-be active, and the choice is therefore explicit.
+Each frame runs four phases. The first mutates the shared chunk map and stays
+serial; the other three are each **one flat list of (view, item) tasks**:
 
-**Level 1 — over views.** The loop over `ViewTask`s. Views share nothing:
-disjoint framebuffer rectangles, private triangle buffers, read-only world. No
-lock, no atomic, no reduction.
-
-```c
-#pragma omp parallel for schedule(runtime) if(parallel_views)
-for (int i = 0; i < scene->view_count; i++)
-    render_view(fb, &scene->views[i], scene, t, measure, !parallel_views);
-```
-
-**Level 2 — inside one view.** All three stages split:
-
-- *Geometry* by **chunk row**, each row filling its own buffer, stitched back in
-  row order afterwards. Row order is exactly the order the serial scan produces,
-  which is what keeps the output identical whatever the thread count. Splitting
-  by an arbitrary partition of the chunks would not.
-- *Rasterization* by **screen band**. Never by triangle: two triangles can cover
-  one pixel and the depth test is a read-modify-write of that shared slot. Each
-  band owns its rows exclusively. `raster_triangle()` takes a clip rectangle for
-  exactly this, and each `ScreenTriangle` carries a clamped bounding box so a
-  band rejects what it does not touch.
-- *Sky* by **row**, which writes disjoint pixels and only reads depth.
-
-**The rule is `view_count >= threads`**, and the crossover sits exactly there:
-
-| N | by view | inside a view |
+| phase | task | why it is safe |
 |---|---|---|
-| 2  | 1.62x | **2.25x** |
-| 4  | 2.59x | **2.92x** |
-| 8  | **4.16x** | 2.99x |
-| 16 | **4.38x** | 3.05x |
+| streaming | — | serial: it mutates the chunk map |
+| geometry | one chunk **row** of one view | each row fills its own buffer |
+| rasterization | one screen **band** of one view | a band owns its rows exclusively |
+| sky | one **slice** of rows of one view | slices write disjoint pixels |
 
-Below the thread count, splitting by view leaves threads idle — two views on
-eight threads uses two of them — while the inner split puts all eight on the one
-frame. At or above it, the view loop saturates the threads with no stitching and
-no scratch buffers.
+Flattening is what keeps efficiency flat. Splitting by view alone gives coarse
+tasks — sixteen views with a 6x cost spread means the heaviest view sets the
+frame time — while splitting inside one view at a time pays for entering a
+parallel region once per view per stage. One flat list of fine tasks avoids
+both, and how finely each view is cut is derived from the thread count so the
+total lands near four tasks per thread whatever the explorer count.
 
-### Speedup (960x720, `--view 96 --ssaa 1`, 8 threads)
+Rasterization is split by **screen band and never by triangle**: two triangles
+can cover one pixel, and the depth test is a read-modify-write of that shared
+slot. `raster_triangle()` has taken a clip rectangle since the sequential
+version was written, which is why the band split was a few lines rather than a
+rewrite.
 
-| N | sequential | 8 threads | speedup | efficiency | FPS | 30 FPS floor |
-|---|---|---|---|---|---|---|
-| 1  |  22.3 ms |  5.9 ms | 3.76 | 47.0% | **168.9** | met |
-| 2  |  25.0 ms |  8.5 ms | 2.96 | 37.0% | **118.4** | met |
-| 4  |  52.3 ms | 19.4 ms | 2.70 | 33.7% | **51.5** | met |
-| 8  |  90.6 ms | 23.4 ms | 3.86 | 48.3% | **42.7** | met |
-| 16 | 167.5 ms | 38.6 ms | 4.35 | 54.3% | 25.9 | close |
+Geometry rows are stitched back **in row order**, exactly the order the serial
+scan produces. That is what makes the output independent of how rows were spread
+across threads, and it is why the split is by row rather than by an arbitrary
+partition of the chunks.
 
-**The floor is met up to eight explorers**, where the first sequential build
-reached it nowhere. One explorer went from 20.4 FPS to 168.9 across the whole
-effort — a factor of 8.3, of which 3.8 is threads and the rest is work removed.
+With a single thread the flattening buys nothing and costs the per-row buffers
+and the stitching, so that case takes the direct path instead.
 
 #### Speedup fell while the program got faster
 

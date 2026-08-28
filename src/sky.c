@@ -163,8 +163,6 @@ void sky_render(Framebuffer *fb, const Viewport *view, const Sky *sky,
 #ifndef _OPENMP
     (void)parallel; /* the sequential build has nothing to split */
 #endif
-    float drift = sky->phase * 3.0f; /* clouds crawl across the day */
-
     /* schedule(dynamic) and not static: rows near the top are open sky and pay
      * the full cloud lookup, rows near the bottom are covered by terrain and
      * skip almost everything. A static split hands one thread all the expensive
@@ -172,7 +170,18 @@ void sky_render(Framebuffer *fb, const Viewport *view, const Sky *sky,
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 8) if(parallel)
 #endif
-    for (int y = 0; y < view->height; y++) {
+    for (int y = 0; y < view->height; y++)
+        sky_render_slice(fb, view, sky, eye, forward, right, up,
+                         tan_half_fov, aspect, y, y);
+}
+
+void sky_render_slice(Framebuffer *fb, const Viewport *view, const Sky *sky,
+                      Vec3 eye, Vec3 forward, Vec3 right, Vec3 up,
+                      float tan_half_fov, float aspect, int y0, int y1)
+{
+    float drift = sky->phase * 3.0f; /* clouds crawl across the day */
+
+    for (int y = y0; y <= y1; y++) {
         int py = view->y + y;
         size_t row = (size_t)py * fb->fb_width;
 
