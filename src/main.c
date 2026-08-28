@@ -1,4 +1,8 @@
 #include <SDL2/SDL.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +42,8 @@ typedef struct {
     int bench_frames;
     int warmup_frames;
     int survey;      /* sample the generator over N x N blocks and report */
+    int threads;     /* 0 = let OpenMP decide */
+    int dynamic_schedule;
     const char *texture_pack;
     const char *dump_path;
 } Options;
@@ -58,6 +64,13 @@ typedef struct {
     Viewport viewport;
     TriangleBuffer triangles;
     size_t triangle_count;
+
+    /* Stage timings live in the task, not in a shared accumulator. Threads
+     * running this loop concurrently would race on a shared one, and the race
+     * would quietly corrupt the very numbers the speedup is judged on. */
+    double seconds_geometry;
+    double seconds_raster;
+    double seconds_sky;
 } ViewTask;
 
 typedef struct {
@@ -69,7 +82,10 @@ typedef struct {
     int view_count;
     float day_length;
     Sky sky;          /* recomputed every frame from the elapsed time */
+    char build_label[64];
 } Scene;
+
+static const char *build_label(const Options *opt, char *buffer, size_t size);
 
 static double now_seconds(void)
 {
@@ -129,6 +145,7 @@ static int scene_init(Scene *scene, const Options *opt)
     scene->scene = opt->scene;
     scene->block_index = opt->block;
     scene->day_length = opt->day_length;
+    build_label(opt, scene->build_label, sizeof(scene->build_label));
     scene->sky = sky_make(DAY_PHASE_START);
 
     /* One world today. Raising world_count and handing each view a different
@@ -197,11 +214,11 @@ typedef struct {
 /* Renders one view. Everything it touches is private to that view or read-only,
  * which is what makes the loop over views safe to run in parallel. */
 static void render_view(Framebuffer *fb, ViewTask *view, const Scene *scene, float t,
-                        FrameTimings *timings)
+                        int measure)
 {
     Mat4 vp = camera_view_proj(&view->camera, t, viewport_aspect(&view->viewport));
 
-    double t0 = timings ? now_seconds() : 0.0;
+    double t0 = measure ? now_seconds() : 0.0;
 
     tribuf_clear(&view->triangles);
     if (scene->scene == SCENE_CHUNK) {
@@ -216,9 +233,9 @@ static void render_view(Framebuffer *fb, ViewTask *view, const Scene *scene, flo
                                          &view->viewport);
     }
 
-    double t1 = timings ? now_seconds() : 0.0;
+    double t1 = measure ? now_seconds() : 0.0;
     raster_flush(fb, &view->triangles);
-    double t2 = timings ? now_seconds() : 0.0;
+    double t2 = measure ? now_seconds() : 0.0;
 
     /* Sky last, so it only fills the pixels the terrain left at the far plane. */
     Vec3 sky_eye, forward, right, up;
@@ -226,11 +243,11 @@ static void render_view(Framebuffer *fb, ViewTask *view, const Scene *scene, flo
     sky_render(fb, &view->viewport, &scene->sky, sky_eye, forward, right, up,
                tanf(view->camera.fov_y_rad * 0.5f), viewport_aspect(&view->viewport));
 
-    if (timings) {
+    if (measure) {
         double t3 = now_seconds();
-        timings->geometry += t1 - t0;
-        timings->raster += t2 - t1;
-        timings->sky += t3 - t2;
+        view->seconds_geometry = t1 - t0;
+        view->seconds_raster = t2 - t1;
+        view->seconds_sky = t3 - t2;
     }
 }
 
@@ -262,14 +279,31 @@ static size_t render_frame(Framebuffer *fb, Scene *scene, float t, FrameTimings 
     /* Phase 2 -- rendering. The world is read-only from here on. */
     framebuffer_clear(fb, 0x0E1622);
 
-    /* >>> The parallel decomposition lives here: this loop over independent
-     * views is the one that becomes an OpenMP parallel for. <<< */
+    /* >>> THE PARALLEL DECOMPOSITION <<<
+     *
+     * Views share nothing: disjoint framebuffer rectangles, private triangle
+     * buffers, read-only access to the world. No lock, no atomic, no reduction.
+     *
+     * schedule(runtime) so the policy can be chosen from the command line:
+     * per-view cost is deliberately uneven, which is exactly the case where
+     * static and dynamic diverge. */
+    int measure = (timings != NULL);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(runtime)
+#endif
     for (int i = 0; i < scene->view_count; i++)
-        render_view(fb, &scene->views[i], scene, t, timings);
+        render_view(fb, &scene->views[i], scene, t, measure);
 
     size_t total = 0;
-    for (int i = 0; i < scene->view_count; i++)
+    for (int i = 0; i < scene->view_count; i++) {
         total += scene->views[i].triangle_count;
+        if (measure) {
+            /* Summed after the loop, never inside it. */
+            timings->geometry += scene->views[i].seconds_geometry;
+            timings->raster += scene->views[i].seconds_raster;
+            timings->sky += scene->views[i].seconds_sky;
+        }
+    }
     return total;
 }
 
@@ -291,6 +325,35 @@ static void draw_viewport_borders(Framebuffer *fb, const Scene *scene)
             fb->color[(size_t)y * fb->fb_width + (size_t)(v->x + v->width - 1)] = border;
         }
     }
+}
+
+/* Reports which build is running and how it is configured. Also the single
+ * place that knows whether OpenMP is compiled in at all. */
+static const char *build_label(const Options *opt, char *buffer, size_t size)
+{
+#ifdef _OPENMP
+    snprintf(buffer, size, "PARALLEL %dT %s", omp_get_max_threads(),
+             opt->dynamic_schedule ? "DYNAMIC" : "STATIC");
+#else
+    (void)opt;
+    snprintf(buffer, size, "SEQUENTIAL");
+#endif
+    return buffer;
+}
+
+/* Applies the thread count and schedule. A no-op in the sequential build, so
+ * --threads and --schedule are accepted and ignored there rather than being an
+ * error: the same command line then works against both binaries, which is what
+ * makes a fair comparison easy to script. */
+static void configure_parallelism(const Options *opt)
+{
+#ifdef _OPENMP
+    if (opt->threads > 0)
+        omp_set_num_threads(opt->threads);
+    omp_set_schedule(opt->dynamic_schedule ? omp_sched_dynamic : omp_sched_static, 0);
+#else
+    (void)opt;
+#endif
 }
 
 /* --------------------------------------------------------------------- HUD */
@@ -326,8 +389,8 @@ static void draw_hud(uint32_t *pixels, int width, int height, const Scene *scene
     int fps_w = overlay_text_width(line, HUD_SCALE);
 
     char info[128];
-    snprintf(info, sizeof(info), "VIEWS %d  TRIS %zu  SSAA %d  SEQUENTIAL",
-             scene->view_count, triangles, ssaa);
+    snprintf(info, sizeof(info), "VIEWS %d  TRIS %zu  SSAA %d  %s",
+             scene->view_count, triangles, ssaa, scene->build_label);
     int info_w = overlay_text_width(info, HUD_SCALE);
 
     char chunks[128];
@@ -397,6 +460,8 @@ static void print_usage(const char *prog)
     printf("      --textures P  texture atlas from scripts/make_texture_atlas.py\n");
     printf("      --dump PATH   render one frame headless into a binary PPM file\n");
     printf("      --survey N    sample terrain over an NxN block area and report\n");
+    printf("      --threads N   OpenMP threads (default: all cores; 0 = auto)\n");
+    printf("      --schedule S  'static' or 'dynamic' loop schedule (default static)\n");
     printf("      --help        show this message\n");
 }
 
@@ -484,6 +549,19 @@ static int parse_options(int argc, char **argv, Options *opt)
             }
         } else if (!strcmp(flag, "--textures")) {
             opt->texture_pack = argv[++i];
+        } else if (!strcmp(flag, "--threads")) {
+            if (!parse_int(argv[++i], flag, 0, 1024, &value)) return -1;
+            opt->threads = (int)value;
+        } else if (!strcmp(flag, "--schedule")) {
+            const char *name = argv[++i];
+            if (!strcmp(name, "dynamic")) {
+                opt->dynamic_schedule = 1;
+            } else if (!strcmp(name, "static")) {
+                opt->dynamic_schedule = 0;
+            } else {
+                fprintf(stderr, "Error: --schedule expects 'static' or 'dynamic', got '%s'\n", name);
+                return -1;
+            }
         } else if (!strcmp(flag, "--survey")) {
             if (!parse_int(argv[++i], flag, 16, 8192, &value)) return -1;
             opt->survey = (int)value;
@@ -548,6 +626,14 @@ static int run_dump(const Options *opt)
     }
     layout_viewports(scene.views, scene.view_count, fb.fb_width, fb.fb_height);
 
+    /* A dumped frame is the correctness reference the parallel build is diffed
+     * against, so it must hold SCENE CONTENT ONLY. Anything that varies with
+     * the build, the clock or the configuration has to stay out of the image:
+     * the frame rate already shows as dashes, and the build label would
+     * otherwise read "SEQUENTIAL" in one binary and "PARALLEL 8T STATIC" in the
+     * other, failing every comparison on text rather than on pixels. */
+    snprintf(scene.build_label, sizeof(scene.build_label), "REFERENCE");
+
     size_t count = render_frame(&fb, &scene, 4.0f, NULL);
     draw_viewport_borders(&fb, &scene);
     framebuffer_resolve(&fb, resolved);
@@ -579,9 +665,11 @@ static int run_benchmark(const Options *opt)
     }
     layout_viewports(scene.views, scene.view_count, fb.fb_width, fb.fb_height);
 
+    char label[64];
     printf("Benchmark: %dx%d, ssaa=%d (%dx%d internal), players=%d, view=%.0f, frames=%d\n",
            opt->width, opt->height, opt->ssaa, fb.fb_width, fb.fb_height,
            opt->players, (double)opt->view_distance, opt->bench_frames);
+    printf("Build:     %s\n", build_label(opt, label, sizeof(label)));
 
     /* Untimed warmup. The very first frames stream thousands of chunks at once,
      * and averaging that startup cost into the steady-state figure understates
@@ -608,6 +696,13 @@ static int run_benchmark(const Options *opt)
            world_chunk_count(&scene.worlds[0]), scene.worlds[0].generated_this_frame);
     printf("Total:      %.4f s\n", elapsed);
     printf("Per frame:  %.4f ms  (%.2f FPS)\n", per_frame_ms, 1000.0 / per_frame_ms);
+    /* With more than one thread these are AGGREGATE WORK across threads, not
+     * wall clock: several views run at once, so the parts can exceed the whole.
+     * They still say where the work is, which is what they are for. */
+#ifdef _OPENMP
+    if (omp_get_max_threads() > 1 && opt->players > 1)
+        printf("  (stage times below are aggregate work across threads)\n");
+#endif
     printf("  stream:   %.4f ms  (%.1f%%)\n",
            timings.stream * 1000.0 / opt->bench_frames, 100.0 * timings.stream / elapsed);
     printf("  geometry: %.4f ms  (%.1f%%)\n",
@@ -854,7 +949,7 @@ static int run_interactive(const Options *opt)
 int main(int argc, char **argv)
 {
     Options opt = { 960, 720, 1, 1, 96.0f, 320.0f, WORLD_DEFAULT_MAX_CHUNKS,
-                    180.0f, 1337u, 0, SCENE_CHUNK, 0, 3, 0, NULL, NULL };
+                    180.0f, 1337u, 0, SCENE_CHUNK, 0, 3, 0, 0, 0, NULL, NULL };
 
     textures_init();
 
@@ -866,6 +961,8 @@ int main(int argc, char **argv)
      * program still runs; the loader has already explained why on stderr. */
     if (opt.texture_pack)
         textures_load_atlas(opt.texture_pack);
+
+    configure_parallelism(&opt);
 
     if (opt.survey > 0) {
         int survey_result = run_survey(&opt);

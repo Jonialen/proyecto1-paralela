@@ -65,8 +65,11 @@ byte differs, there is a race. Protecting it constrains what you may do:
   visits chunks in a sorted box scan, never in hash order.
 - **When splitting work across threads, fix the merge order.** Per-thread
   `TriangleBuffer`s must be concatenated in a deterministic sequence.
-- **Never draw wall-clock values into a dumped frame.** Headless dumps show
-  `FPS ---` on purpose.
+- **A dumped frame contains scene content only.** Nothing that varies with the
+  build, the clock or the configuration may reach those pixels. The frame rate
+  shows as dashes and the build label as `REFERENCE` for this reason. This has
+  already broken the comparison twice; when a diff fails, check *which rows*
+  differ before suspecting the renderer.
 - **Keep procedural generation seeded and pure.** Terrain and textures are
   functions of coordinates and a seed. No global RNG state, no time input.
 

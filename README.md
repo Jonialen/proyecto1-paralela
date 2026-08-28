@@ -384,6 +384,64 @@ what the parallel version is for, but the arithmetic has to be faced: 8 cores
 mean 1.5x is comfortable at N = 1 and 17x is impossible at N = 16. Either the
 demo runs at a modest N, or the quality knobs come down, or both.
 
+## Parallel version
+
+Two binaries are built from the same sources. `_OPENMP` guards every pragma and
+every `omp_*` call, so `cubeview-seq` is a genuine single-threaded program, not
+the parallel one with its thread count pinned to 1.
+
+```sh
+make                    # builds cubeview and cubeview-seq
+./cubeview -n 8 --threads 8 --schedule dynamic
+./cubeview-seq -n 8
+```
+
+`--threads` and `--schedule` are accepted and ignored by the sequential build, so
+the same command line drives both and comparisons are easy to script.
+
+### Level 1: parallel over views
+
+```c
+#pragma omp parallel for schedule(runtime)
+for (int i = 0; i < scene->view_count; i++)
+    render_view(fb, &scene->views[i], scene, t, measure);
+```
+
+Views share nothing — disjoint framebuffer rectangles, private triangle buffers,
+read-only world — so there is no lock, no atomic and no reduction. Stage timings
+live in each `ViewTask` and are summed after the loop; a shared accumulator
+would race on exactly the numbers the speedup is judged on.
+
+### Speedup (960x720, `--view 96 --ssaa 1`, 8 threads)
+
+| N | sequential | 8 threads | speedup | efficiency |
+|---|---|---|---|---|
+| 1  |  49.1 ms |  49.1 ms | 1.00 | 12.5% |
+| 2  |  79.1 ms |  48.6 ms | 1.63 | 20.4% |
+| 4  | 157.1 ms |  64.5 ms | 2.44 | 30.4% |
+| 8  | 297.6 ms |  74.8 ms | 3.98 | 49.7% |
+| 16 | 569.5 ms | 160.7 ms | 3.54 | 44.3% |
+
+**At one explorer the speedup is exactly 1.00, and that is not a defect.** The
+loop has a single iteration: there is nothing to divide. This is the limit of a
+view-level decomposition and the reason a second level is needed, since `-n 1`
+is also the configuration closest to the frame-rate floor.
+
+### Scheduling policy
+
+| N | `static` | `dynamic` | winner |
+|---|---|---|---|
+| 4  |  60.8 ms |  82.4 ms | static, by 35% |
+| 8  |  79.4 ms |  85.7 ms | static, by 8% |
+| 16 | 139.3 ms | 124.7 ms | **dynamic, by 10%** |
+
+The crossover is the interesting part. Per-view cost is deliberately uneven —
+the spread at sixteen explorers is **6.0x** between the lightest and heaviest
+view — but unevenness alone does not make `dynamic` win. With four views on
+eight threads every thread takes at most one view, so there is nothing to
+rebalance and dynamic only adds its own overhead. Only once threads carry two or
+more views does the imbalance outweigh that overhead.
+
 ## Determinism
 
 Textures, terrain, the flight paths and the benchmark time step all use fixed
@@ -395,7 +453,8 @@ makes `--dump` a correctness check for the parallel build:
 cmp reference.ppm candidate.ppm
 ```
 
-If a single byte differs, there is a race.
+If a single byte differs, there is a race. Verified across 1, 2, 4, 8 and 16
+threads under both schedules: byte-identical to `cubeview-seq` in every case.
 
 Two things this required:
 

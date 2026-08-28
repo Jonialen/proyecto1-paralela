@@ -1,7 +1,7 @@
 CC      ?= gcc
-CFLAGS  ?= -std=c11 -O2 -Wall -Wextra
+BASE    := -std=c11 -O2 -Wall -Wextra
+SDL     := $(shell pkg-config --cflags sdl2)
 LDLIBS  := $(shell pkg-config --libs sdl2) -lm
-CFLAGS  += $(shell pkg-config --cflags sdl2)
 
 # -MMD -MP makes the compiler emit a .d file listing every header each object
 # depends on. Without it, editing a header leaves stale objects behind: struct
@@ -9,30 +9,45 @@ CFLAGS  += $(shell pkg-config --cflags sdl2)
 # memory in ways that look like bugs in the code you just wrote.
 DEPFLAGS := -MMD -MP
 
-BIN := cubeview
 SRC := $(wildcard src/*.c)
-OBJ := $(SRC:.c=.o)
-DEP := $(OBJ:.o=.d)
 
-all: $(BIN)
+# Two binaries from one source tree. The parallel build defines _OPENMP, which
+# every omp pragma and every omp_* call is guarded on, so the sequential build
+# is a genuine single-threaded program and not just the parallel one with the
+# thread count pinned to 1.
+PAR_OBJ := $(SRC:src/%.c=build/par/%.o)
+SEQ_OBJ := $(SRC:src/%.c=build/seq/%.o)
+DEP     := $(PAR_OBJ:.o=.d) $(SEQ_OBJ:.o=.d)
 
-$(BIN): $(OBJ)
-	$(CC) $(CFLAGS) -o $@ $(OBJ) $(LDLIBS)
+all: cubeview cubeview-seq
 
-src/%.o: src/%.c
-	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
+cubeview: $(PAR_OBJ)
+	$(CC) $(BASE) -fopenmp -o $@ $^ $(LDLIBS)
 
-run: $(BIN)
-	./$(BIN) -n 4
+cubeview-seq: $(SEQ_OBJ)
+	$(CC) $(BASE) -o $@ $^ $(LDLIBS)
 
-bench: $(BIN)
-	./$(BIN) -n 4 --view 96 --ssaa 2 --warmup 4 --bench 20
+build/par/%.o: src/%.c | build/par
+	$(CC) $(BASE) $(SDL) -fopenmp $(DEPFLAGS) -c $< -o $@
 
-sweep: $(BIN)
+build/seq/%.o: src/%.c | build/seq
+	$(CC) $(BASE) $(SDL) $(DEPFLAGS) -c $< -o $@
+
+build/par build/seq:
+	mkdir -p $@
+
+run: cubeview
+	./cubeview -n 4
+
+bench: all
+	./cubeview-seq -n 4 --view 96 --ssaa 1 --warmup 4 --bench 10
+	./cubeview     -n 4 --view 96 --ssaa 1 --warmup 4 --bench 10
+
+sweep: all
 	./scripts/sweep.sh
 
 clean:
-	rm -f $(OBJ) $(DEP) $(BIN)
+	rm -rf build cubeview cubeview-seq
 
 -include $(DEP)
 
