@@ -330,6 +330,17 @@ camera's geometry can never bleed into a neighbouring pane.
 load: a busy desktop shifts every stage by the same factor, which looks exactly
 like a regression in whatever you changed last.
 
+```sh
+make bitacora     # 10 repetitions per point, both builds, mean and deviation
+```
+
+`scripts/bitacora.sh` writes every individual run to `bitacora.csv` and
+`scripts/bitacora_report.py` aggregates it. They are separate so the tables can
+be regenerated without measuring again, and so the raw runs survive for plotting.
+Every mean is printed with its standard deviation: a speedup quoted without one
+cannot be told apart from noise, and load on this machine has moved the same
+measurement by more than half.
+
 ### Explorers (`--view 96 --ssaa 1`)
 
 | N | triangles | chunks | ms/frame | FPS | geometry | raster | sky |
@@ -631,5 +642,7 @@ free when it streams through cache.
 | `src/world.{h,c}` | Chunk map, streaming, eviction, terrain, `world_emit_view()` |
 | `src/overlay.{h,c}` | Embedded 5x7 bitmap font and HUD primitives |
 | `src/main.c` | CLI, scene setup, split-screen layout, render loop, modes |
-| `scripts/sweep.sh` | Benchmark sweep used to produce the tables above |
+| `scripts/sweep.sh` | Quick benchmark sweep, one run per point |
+| `scripts/bitacora.sh` | Test log: repeated runs on both builds, raw CSV |
+| `scripts/bitacora_report.py` | Aggregates that CSV into the report tables |
 | `scripts/make_texture_atlas.py` | Converts a texture pack into the atlas format |

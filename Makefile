@@ -46,9 +46,14 @@ bench: all
 sweep: all
 	./scripts/sweep.sh
 
+# Test log for the report: 10 repetitions per point on both builds, mean and
+# standard deviation, raw runs kept in bitacora.csv.
+bitacora: all
+	./scripts/bitacora.sh bitacora.csv
+
 clean:
 	rm -rf build cubeview cubeview-seq
 
 -include $(DEP)
 
-.PHONY: all run bench sweep clean
+.PHONY: all run bench sweep bitacora clean

@@ -8,6 +8,7 @@ build/
 # Benchmark and debug output
 *.ppm
 *.png
+bitacora.csv
 
 # Texture packs and the atlases built from them. Third-party art must not be
 # redistributed: the repository is made public for grading, so packs stay out.
