@@ -146,6 +146,26 @@ Breaking these is possible but must be deliberate and recorded in
 - **Procedural textures are the fallback and must keep working.** A missing or
   malformed pack is reported and ignored, never fatal.
 
+## Optimizations that were tried and did not pay
+
+Recorded so they are not attempted again. Both were measured, not guessed.
+
+- **Reordering the early-out in `raster_triangle()`.** Testing band overlap
+  before computing the signed area looks like it should skip work on the ~97% of
+  calls that reject. Neutral: reading `min_x` already pulls in the cache line the
+  vertices share, so the arithmetic saved was free. The ordering was kept because
+  it is the honest one, not because it helped.
+- **Binning triangles into bands** so each band walks only the triangles it
+  touches. Rasterization did drop 9-12%, but the counting sort cost 13-23% more
+  in the geometry stage and the frame got *worse* at four and eight explorers.
+  The redundant scan is cheap because it walks the triangle array linearly and
+  stays in cache after the first band; the sort does integer divisions and
+  scattered writes, which is real work. Reverted.
+
+The lesson both share: a rejection that looks expensive by instruction count can
+be nearly free when it streams through cache, while the bookkeeping meant to
+avoid it is not.
+
 ## Parallelization notes
 
 Not implemented yet — the sequential baseline comes first, by decision.

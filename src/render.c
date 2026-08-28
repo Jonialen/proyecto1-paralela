@@ -390,6 +390,19 @@ size_t cube_emit(TriangleBuffer *out, const Block *block, Mat4 model, Mat4 vp,
 void raster_triangle(Framebuffer *fb, const ScreenTriangle *tri,
                      int clip_min_x, int clip_min_y, int clip_max_x, int clip_max_y)
 {
+    /* Overlap test before any arithmetic. Band-parallel rasterization calls
+     * this once per triangle per band and almost every call rejects.
+     *
+     * Measured neutral on its own: reading min_x already pulls in the cache
+     * line the vertices share, so the arithmetic it skips was free. Kept
+     * because the ordering is the honest one. */
+    int min_x = imax(tri->min_x, clip_min_x);
+    int max_x = imin(tri->max_x, clip_max_x);
+    int min_y = imax(tri->min_y, clip_min_y);
+    int max_y = imin(tri->max_y, clip_max_y);
+    if (min_x > max_x || min_y > max_y)
+        return;
+
     const ScreenVertex *a = &tri->v[0];
     const ScreenVertex *b = &tri->v[1];
     const ScreenVertex *c = &tri->v[2];
@@ -398,13 +411,6 @@ void raster_triangle(Framebuffer *fb, const ScreenTriangle *tri,
     if (area >= 0.0f)
         return;
     float inv_area = 1.0f / area;
-
-    int min_x = imax(tri->min_x, clip_min_x);
-    int max_x = imin(tri->max_x, clip_max_x);
-    int min_y = imax(tri->min_y, clip_min_y);
-    int max_y = imin(tri->max_y, clip_max_y);
-    if (min_x > max_x || min_y > max_y)
-        return;
 
     /* This double loop is the hot spot of the whole program: it is where the
      * per-pixel work lives, and the natural target for parallelization later. */
