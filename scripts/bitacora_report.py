@@ -30,14 +30,26 @@ def stats(values):
 
 
 def load(path):
+    """Group the runs by configuration, and count the repetitions separately.
+
+    The repetition count cannot be read back from the group sizes. The thread
+    scaling test measures its sequential baseline once per thread count, and
+    every one of those runs has the same configuration, so they all land in a
+    single group whose length is a multiple of the real repetition count. The
+    pooling is wanted -- it tightens the baseline -- but it makes len() lie
+    about how many times each point was measured. The rep column is the only
+    honest source.
+    """
     runs = defaultdict(list)
+    reps = set()
     with open(path, newline="") as f:
         for row in csv.DictReader(f):
             if not row["frame_ms"]:
                 continue
             key = (row["test"], row["build"], int(row["n"]), int(row["threads"]))
             runs[key].append(float(row["frame_ms"]))
-    return runs
+            reps.add(int(row["rep"]))
+    return runs, len(reps)
 
 
 def line(width=94):
@@ -71,11 +83,10 @@ def report_speedup(runs, tests, title, label, keys):
 
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else "bitacora.csv"
-    runs = load(path)
+    runs, reps = load(path)
     if not runs:
         sys.exit(f"no usable rows in {path}")
 
-    reps = max(len(v) for v in runs.values())
     print(f"Test log from {path} -- {reps} repetitions per point")
     print("Speedup is sequential mean over parallel mean. Efficiency is speedup "
           "over thread count.")
