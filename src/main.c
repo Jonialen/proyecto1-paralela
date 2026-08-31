@@ -21,6 +21,13 @@
 #define MAX_PLAYERS 16
 #define BENCH_DT (1.0f / 60.0f) /* fixed step: benchmarks must be reproducible */
 
+/* The ordinary build intentionally has no strategy macro: it remains the
+ * flat-task implementation used as the baseline. Experimental binaries set
+ * exactly one of these macros from the Makefile. */
+#if defined(PARALLEL_STRATEGY_TASK) && defined(PARALLEL_STRATEGY_NESTED)
+#error "select only one experimental parallel strategy"
+#endif
+
 /* Where the cycle starts at t = 0. Mid-morning, so a fresh run and every
  * headless dump open in daylight instead of the middle of the night. */
 #define DAY_PHASE_START 0.28f
@@ -360,6 +367,269 @@ static void view_prepare(ViewTask *view, const Scene *scene, float t)
     (void)scene;
 }
 
+/* OpenMP tasks keep the same deterministic units as the flat implementation.
+ * Tasks may finish in any order, but geometry is stitched by cell index and
+ * every raster/sky task owns a disjoint screen band or row slice. */
+static size_t render_frame_task_strategy(Framebuffer *fb, Scene *scene,
+                                         float t, FrameTimings *timings)
+{
+    if (scene->scene != SCENE_CHUNK) {
+        size_t total = 0;
+        for (int i = 0; i < scene->view_count; i++) {
+            render_view(fb, &scene->views[i], scene, t, timings != NULL, 1);
+            total += scene->views[i].triangle_count;
+            if (timings) {
+                timings->geometry += scene->views[i].seconds_geometry;
+                timings->raster += scene->views[i].seconds_raster;
+                timings->sky += scene->views[i].seconds_sky;
+            }
+        }
+        return total;
+    }
+
+    int threads = 1;
+#ifdef _OPENMP
+    threads = omp_get_max_threads();
+#endif
+    if (threads <= 1) {
+        size_t total = 0;
+        for (int i = 0; i < scene->view_count; i++) {
+            render_view(fb, &scene->views[i], scene, t, timings != NULL, 0);
+            total += scene->views[i].triangle_count;
+            if (timings) {
+                timings->geometry += scene->views[i].seconds_geometry;
+                timings->raster += scene->views[i].seconds_raster;
+                timings->sky += scene->views[i].seconds_sky;
+            }
+        }
+        return total;
+    }
+
+    for (int i = 0; i < scene->view_count; i++)
+        view_prepare(&scene->views[i], scene, t);
+
+    int splits = (threads * TASKS_PER_THREAD + scene->view_count - 1) /
+                 scene->view_count;
+    if (splits < MIN_SPLITS_PER_VIEW)
+        splits = MIN_SPLITS_PER_VIEW;
+
+    double t0 = timings ? now_seconds() : 0.0;
+#pragma omp parallel
+    {
+#pragma omp single
+        {
+            for (int v = 0; v < scene->view_count; v++) {
+                ViewTask *view = &scene->views[v];
+                int cells = view->row_count * view->row_count;
+                for (int c = 0; c < cells; c++) {
+#pragma omp task firstprivate(v, c)
+                    {
+                        ViewTask *task_view = &scene->views[v];
+                        tribuf_clear(&task_view->cells[c]);
+                        world_emit_chunk(&task_view->cells[c], task_view->world,
+                                         task_view->eye,
+                                         task_view->camera.view_distance,
+                                         task_view->vp, &scene->sky.light,
+                                         &task_view->viewport,
+                                         &task_view->frustum,
+                                         c / task_view->row_count,
+                                         c % task_view->row_count);
+                    }
+                }
+            }
+#pragma omp taskwait
+        }
+    }
+
+    double t1 = timings ? now_seconds() : 0.0;
+#pragma omp parallel
+    {
+#pragma omp single
+        {
+            for (int v = 0; v < scene->view_count; v++) {
+#pragma omp task firstprivate(v)
+                {
+                    ViewTask *view = &scene->views[v];
+                    tribuf_clear(&view->triangles);
+                    int cells = view->row_count * view->row_count;
+                    for (int c = 0; c < cells; c++)
+                        tribuf_append(&view->triangles, &view->cells[c]);
+                    view->triangle_count = view->triangles.count;
+                }
+            }
+#pragma omp taskwait
+        }
+    }
+
+    double t2 = timings ? now_seconds() : 0.0;
+#pragma omp parallel
+    {
+#pragma omp single
+        {
+            for (int v = 0; v < scene->view_count; v++) {
+                ViewTask *view = &scene->views[v];
+                for (int b = 0; b < splits; b++) {
+#pragma omp task firstprivate(v, b)
+                    {
+                        ViewTask *task_view = &scene->views[v];
+                        const Viewport *vp = &task_view->viewport;
+                        int y0 = vp->y + (int)((long)vp->height * b / splits);
+                        int y1 = vp->y + (int)((long)vp->height * (b + 1) /
+                                               splits) - 1;
+                        for (size_t k = 0; k < task_view->triangles.count; k++)
+                            raster_triangle(fb, &task_view->triangles.data[k],
+                                            vp->x, y0, vp->x + vp->width - 1, y1);
+                    }
+                }
+            }
+#pragma omp taskwait
+        }
+    }
+
+    double t3 = timings ? now_seconds() : 0.0;
+#pragma omp parallel
+    {
+#pragma omp single
+        {
+            for (int v = 0; v < scene->view_count; v++) {
+                ViewTask *view = &scene->views[v];
+                for (int sl = 0; sl < splits; sl++) {
+#pragma omp task firstprivate(v, sl)
+                    {
+                        ViewTask *task_view = &scene->views[v];
+                        const Viewport *vp = &task_view->viewport;
+                        int y0 = (int)((long)vp->height * sl / splits);
+                        int y1 = (int)((long)vp->height * (sl + 1) / splits) - 1;
+                        sky_render_slice(fb, vp, &scene->sky, task_view->eye,
+                                         task_view->forward, task_view->right,
+                                         task_view->up,
+                                         tanf(task_view->camera.fov_y_rad * 0.5f),
+                                         viewport_aspect(vp), y0, y1);
+                    }
+                }
+            }
+#pragma omp taskwait
+        }
+    }
+
+    if (timings) {
+        timings->geometry += t1 - t0;
+        timings->raster += t3 - t2;
+        timings->sky += (timings ? now_seconds() : 0.0) - t3;
+    }
+
+    size_t total = 0;
+    for (int i = 0; i < scene->view_count; i++)
+        total += scene->views[i].triangle_count;
+    return total;
+}
+
+/* Deliberately nests a parallel region inside the player loop. The outer loop
+ * already occupies workers while each player starts its own team, making this
+ * a useful negative control for oversubscription measurements. */
+static size_t render_frame_nested_strategy(Framebuffer *fb, Scene *scene,
+                                           float t, FrameTimings *timings)
+{
+    if (scene->scene != SCENE_CHUNK) {
+        size_t total = 0;
+        for (int i = 0; i < scene->view_count; i++) {
+            render_view(fb, &scene->views[i], scene, t, timings != NULL, 1);
+            total += scene->views[i].triangle_count;
+            if (timings) {
+                timings->geometry += scene->views[i].seconds_geometry;
+                timings->raster += scene->views[i].seconds_raster;
+                timings->sky += scene->views[i].seconds_sky;
+            }
+        }
+        return total;
+    }
+
+    int threads = 1;
+#ifdef _OPENMP
+    threads = omp_get_max_threads();
+#endif
+    if (threads <= 1) {
+        size_t total = 0;
+        for (int i = 0; i < scene->view_count; i++) {
+            render_view(fb, &scene->views[i], scene, t, timings != NULL, 0);
+            total += scene->views[i].triangle_count;
+            if (timings) {
+                timings->geometry += scene->views[i].seconds_geometry;
+                timings->raster += scene->views[i].seconds_raster;
+                timings->sky += scene->views[i].seconds_sky;
+            }
+        }
+        return total;
+    }
+
+    int splits = (threads * TASKS_PER_THREAD + scene->view_count - 1) /
+                 scene->view_count;
+    if (splits < MIN_SPLITS_PER_VIEW)
+        splits = MIN_SPLITS_PER_VIEW;
+
+#pragma omp parallel for schedule(runtime)
+    for (int v = 0; v < scene->view_count; v++) {
+        ViewTask *view = &scene->views[v];
+        double stage_start = timings ? now_seconds() : 0.0;
+        view_prepare(view, scene, t);
+        int cells = view->row_count * view->row_count;
+#pragma omp parallel for schedule(runtime)
+        for (int c = 0; c < cells; c++) {
+            tribuf_clear(&view->cells[c]);
+            world_emit_chunk(&view->cells[c], view->world, view->eye,
+                             view->camera.view_distance, view->vp,
+                             &scene->sky.light, &view->viewport, &view->frustum,
+                             c / view->row_count, c % view->row_count);
+        }
+        tribuf_clear(&view->triangles);
+        for (int c = 0; c < cells; c++)
+            tribuf_append(&view->triangles, &view->cells[c]);
+        view->triangle_count = view->triangles.count;
+        double geometry_done = timings ? now_seconds() : 0.0;
+
+#pragma omp parallel for schedule(runtime)
+        for (int b = 0; b < splits; b++) {
+            const Viewport *vp = &view->viewport;
+            int y0 = vp->y + (int)((long)vp->height * b / splits);
+            int y1 = vp->y + (int)((long)vp->height * (b + 1) / splits) - 1;
+            for (size_t k = 0; k < view->triangles.count; k++)
+                raster_triangle(fb, &view->triangles.data[k], vp->x, y0,
+                                vp->x + vp->width - 1, y1);
+        }
+        double raster_done = timings ? now_seconds() : 0.0;
+
+#pragma omp parallel for schedule(runtime)
+        for (int sl = 0; sl < splits; sl++) {
+            const Viewport *vp = &view->viewport;
+            int y0 = (int)((long)vp->height * sl / splits);
+            int y1 = (int)((long)vp->height * (sl + 1) / splits) - 1;
+            sky_render_slice(fb, vp, &scene->sky, view->eye, view->forward,
+                             view->right, view->up,
+                             tanf(view->camera.fov_y_rad * 0.5f),
+                             viewport_aspect(vp), y0, y1);
+        }
+        double sky_done = timings ? now_seconds() : 0.0;
+        if (timings) {
+            view->seconds_geometry = geometry_done - stage_start;
+            view->seconds_raster = raster_done - geometry_done;
+            view->seconds_sky = sky_done - raster_done;
+        }
+    }
+
+    if (timings) {
+        for (int i = 0; i < scene->view_count; i++) {
+            timings->geometry += scene->views[i].seconds_geometry;
+            timings->raster += scene->views[i].seconds_raster;
+            timings->sky += scene->views[i].seconds_sky;
+        }
+    }
+
+    size_t total = 0;
+    for (int i = 0; i < scene->view_count; i++)
+        total += scene->views[i].triangle_count;
+    return total;
+}
+
 static size_t render_frame(Framebuffer *fb, Scene *scene, float t, FrameTimings *timings)
 {
     double stream_start = timings ? now_seconds() : 0.0;
@@ -386,6 +656,12 @@ static size_t render_frame(Framebuffer *fb, Scene *scene, float t, FrameTimings 
         timings->stream += now_seconds() - stream_start;
 
     framebuffer_clear(fb, 0x0E1622);
+
+#if defined(PARALLEL_STRATEGY_TASK)
+    return render_frame_task_strategy(fb, scene, t, timings);
+#elif defined(PARALLEL_STRATEGY_NESTED)
+    return render_frame_nested_strategy(fb, scene, t, timings);
+#else
 
     /* The block scene is a single cube for inspecting textures; it has no chunk
      * rows to flatten, so it keeps the simple path. */
@@ -553,6 +829,7 @@ static size_t render_frame(Framebuffer *fb, Scene *scene, float t, FrameTimings 
     for (int v = 0; v < scene->view_count; v++)
         total += scene->views[v].triangle_count;
     return total;
+#endif
 }
 
 /* Thin separators so the split-screen panes read as separate windows. */
@@ -596,6 +873,11 @@ static const char *build_label(const Options *opt, char *buffer, size_t size)
 static void configure_parallelism(const Options *opt)
 {
 #ifdef _OPENMP
+#ifdef PARALLEL_STRATEGY_NESTED
+    /* The nested variant is intentionally a control experiment: inner teams
+     * must be allowed to form while the outer player loop is active. */
+    omp_set_nested(1);
+#endif
     if (opt->threads > 0)
         omp_set_num_threads(opt->threads);
     omp_set_schedule(opt->dynamic_schedule ? omp_sched_dynamic : omp_sched_static, 0);

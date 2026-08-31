@@ -17,7 +17,10 @@ SRC := $(wildcard src/*.c)
 # thread count pinned to 1.
 PAR_OBJ := $(SRC:src/%.c=build/par/%.o)
 SEQ_OBJ := $(SRC:src/%.c=build/seq/%.o)
+TASK_OBJ := $(SRC:src/%.c=build/task/%.o)
+NESTED_OBJ := $(SRC:src/%.c=build/nested/%.o)
 DEP     := $(PAR_OBJ:.o=.d) $(SEQ_OBJ:.o=.d)
+DEP     += $(TASK_OBJ:.o=.d) $(NESTED_OBJ:.o=.d)
 
 all: cubeview cubeview-seq
 
@@ -27,13 +30,27 @@ cubeview: $(PAR_OBJ)
 cubeview-seq: $(SEQ_OBJ)
 	$(CC) $(BASE) -o $@ $^ $(LDLIBS)
 
+# Experimental alternatives. The original targets above remain unchanged and
+# each strategy has its own object directory so builds cannot mix macros.
+cubeview-task: $(TASK_OBJ)
+	$(CC) $(BASE) -fopenmp -o $@ $^ $(LDLIBS)
+
+cubeview-nested: $(NESTED_OBJ)
+	$(CC) $(BASE) -fopenmp -o $@ $^ $(LDLIBS)
+
 build/par/%.o: src/%.c | build/par
 	$(CC) $(BASE) $(SDL) -fopenmp $(DEPFLAGS) -c $< -o $@
 
 build/seq/%.o: src/%.c | build/seq
 	$(CC) $(BASE) $(SDL) $(DEPFLAGS) -c $< -o $@
 
-build/par build/seq:
+build/task/%.o: src/%.c | build/task
+	$(CC) $(BASE) $(SDL) -fopenmp -DPARALLEL_STRATEGY_TASK $(DEPFLAGS) -c $< -o $@
+
+build/nested/%.o: src/%.c | build/nested
+	$(CC) $(BASE) $(SDL) -fopenmp -DPARALLEL_STRATEGY_NESTED $(DEPFLAGS) -c $< -o $@
+
+build/par build/seq build/task build/nested:
 	mkdir -p $@
 
 run: cubeview
@@ -56,4 +73,4 @@ clean:
 
 -include $(DEP)
 
-.PHONY: all run bench sweep bitacora clean
+.PHONY: all run bench sweep bitacora clean cubeview-task cubeview-nested
